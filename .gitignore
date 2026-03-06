@@ -17,5 +17,7 @@ game_registry.json
 models
 key.json
 model_registry.json
+model_registries/
 trainer*.py
-CLAUDE.md
+.venv/
+.venv/
