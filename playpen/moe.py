@@ -51,6 +51,7 @@ class MoeConfig:
     routes: Tuple[MoeRoute, ...]
     route_by_experiment: bool = False
     router: Optional["TextRouterConfig"] = None
+    loss_router: Optional["LossRouterConfig"] = None
 
     def select_model(self, game: str, experiment: Optional[str] = None, *, context_text: str = "") -> str:
         for route in self.routes:
@@ -71,6 +72,14 @@ class MoeConfig:
 class TextRouterConfig:
     path: str
     min_confidence: float = 0.0
+
+
+@dataclass(frozen=True)
+class LossRouterConfig:
+    experts: Tuple[str, ...]
+    log_path: Optional[str] = None
+    oracle_field: str = "oracle_expert"
+    id_regimes: Tuple[str, ...] = ("id",)
 
 
 class NaiveBayesTextRouter:
@@ -313,6 +322,34 @@ def load_moe_config(moe: str, *, default_name: str, default_model: str) -> MoeCo
             min_confidence=float(router_cfg.get("min_confidence", 0.0) or 0.0),
         )
 
+    loss_router_cfg = payload.get("loss_router")
+    loss_router: Optional[LossRouterConfig] = None
+    if loss_router_cfg is not None:
+        if not isinstance(loss_router_cfg, Mapping):
+            raise ValueError("MoE config field 'loss_router' must be an object/dict.")
+        experts_raw = loss_router_cfg.get("experts")
+        if experts_raw is None:
+            experts = tuple()
+        elif isinstance(experts_raw, str):
+            experts = (str(experts_raw),)
+        else:
+            if not isinstance(experts_raw, Sequence):
+                raise ValueError("MoE loss_router field 'experts' must be a string or list of strings.")
+            experts = tuple(str(x) for x in experts_raw if x)
+        id_regimes_raw = loss_router_cfg.get("id_regimes", ("id",))
+        if isinstance(id_regimes_raw, str):
+            id_regimes = (id_regimes_raw,)
+        elif isinstance(id_regimes_raw, Sequence):
+            id_regimes = tuple(str(x) for x in id_regimes_raw if x)
+        else:
+            raise ValueError("MoE loss_router field 'id_regimes' must be a string or list of strings.")
+        loss_router = LossRouterConfig(
+            experts=experts,
+            log_path=str(loss_router_cfg["log_path"]) if loss_router_cfg.get("log_path") else None,
+            oracle_field=str(loss_router_cfg.get("oracle_field", "oracle_expert") or "oracle_expert"),
+            id_regimes=id_regimes or ("id",),
+        )
+
     game_map = payload.get("game_map") or payload.get("game_name_map") or payload.get("game_to_model")
     game_map_routes: List[Dict[str, str]] = []
     if game_map is not None:
@@ -375,6 +412,7 @@ def load_moe_config(moe: str, *, default_name: str, default_model: str) -> MoeCo
         routes=tuple(routes),
         route_by_experiment=route_by_experiment,
         router=router,
+        loss_router=loss_router,
     )
 
 

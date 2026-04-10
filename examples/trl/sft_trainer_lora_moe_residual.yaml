@@ -1,0 +1,55 @@
+training:
+  per_game_max_samples: all
+  max_length: 2048
+  per_device_train_batch_size: 2
+  per_device_eval_batch_size: 2
+  gradient_accumulation_steps: 8
+  learning_rate: 5.0e-5
+  learning_rates:
+    lora: 1.0e-5
+    experts: 2.0e-5
+    routers: 5.0e-5
+  num_train_epochs: 3.0
+  lr_scheduler_type: constant_with_warmup
+  warmup_ratio: 0.03
+  gradient_checkpointing: true
+  seed: 7331
+  eval_strategy: epoch
+  logging_steps: 10
+  save_strategy: steps
+  save_steps: 100
+  save_total_limit: 3
+  load_best_model_at_end: true
+  metric_for_best_model: eval_loss
+  greater_is_better: false
+  weight_decay: 0.01
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  max_grad_norm: 1.0
+  load_balance_loss_coef: 0.01
+  router_z_loss_coef: 1.0e-4
+
+moe:
+  run_suffix: moe-residual
+  num_moe_layers: 4
+  num_experts: 4
+  top_k: 1
+  expert_hidden_size: 8192
+  activation: silu
+  alpha: 0.1
+  capacity_factor_train: 1.25
+  capacity_factor_eval: 2.0
+  init_noise_std: 1.0e-3
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules:
+    - gate_proj
+    - up_proj
+    - down_proj
+  task_type: CAUSAL_LM
+
+routing:
+  flush_every_steps: 1

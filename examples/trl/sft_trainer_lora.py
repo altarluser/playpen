@@ -8,6 +8,7 @@ import re
 from datetime import datetime
 from collections import Counter
 from pathlib import Path
+import torch
 
 from clemcore.backends.huggingface_local_api import HuggingfaceLocalModel
 from clemcore.clemgame import GameRegistry
@@ -22,6 +23,51 @@ try:
     import wandb
 except Exception:
     wandb = None
+
+try:
+    import yaml
+except Exception:
+    yaml = None
+
+
+DEFAULT_SFT_CONFIG = {
+    "training": {
+        "per_game_max_samples": 620,
+        "max_length": 2048,
+        "per_device_train_batch_size": 2,
+        "per_device_eval_batch_size": 2,
+        "gradient_accumulation_steps": 8,
+        "learning_rate": 5e-6,
+        "lr_scheduler_type": "linear",
+        "warmup_ratio": 0.03,
+        "gradient_checkpointing": True,
+        "seed": 7331,
+        "eval_strategy": "epoch",
+        "logging_steps": 10,
+        "save_strategy": "steps",
+        "save_steps": 100,
+        "save_total_limit": 3,
+        "load_best_model_at_end": False,
+        "metric_for_best_model": "eval_loss",
+        "greater_is_better": False,
+        "epochs": {
+            "combined": 2.0,
+            "game": {
+                "lt_3000": 4.0,
+                "lt_6000": 3.0,
+                "gte_6000": 3.0,
+            },
+        },
+    },
+    "lora": {
+        "r": 16,
+        "alpha": 32,
+        "dropout": 0.05,
+        "target_modules": "all-linear",
+        "modules_to_save": ["lm_head", "embed_tokens"],
+        "task_type": "CAUSAL_LM",
+    },
+}
 
 
 def use_bf16() -> bool:
@@ -41,6 +87,49 @@ def use_wandb() -> bool:
     return raw.lower() not in {"0", "false", "no", "off"}
 
 
+def wandb_init_timeout() -> int:
+    raw = os.getenv("WANDB_INIT_TIMEOUT", "180")
+    try:
+        value = int(str(raw).strip())
+        return max(30, value)
+    except Exception:
+        return 180
+
+
+def _deep_update(base: dict, updates: dict) -> dict:
+    for key, value in (updates or {}).items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _deep_update(base[key], value)
+        else:
+            base[key] = value
+    return base
+
+
+def load_sft_config() -> dict:
+    cfg = copy.deepcopy(DEFAULT_SFT_CONFIG)
+    cfg_path = Path(
+        os.getenv("PLAYPEN_SFT_CONFIG", str(Path(__file__).with_suffix(".yaml")))
+    ).expanduser()
+    if cfg_path.exists():
+        if yaml is None:
+            raise RuntimeError(
+                f"Config file exists at {cfg_path} but PyYAML is not installed."
+            )
+        payload = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+        if not isinstance(payload, dict):
+            raise ValueError(f"SFT config must be a YAML object at top level: {cfg_path}")
+        _deep_update(cfg, payload)
+        print(f"Loaded SFT config from {cfg_path}")
+    else:
+        print(f"SFT config file not found at {cfg_path}; using built-in defaults.")
+
+    # Keep backward-compatible env override for per-game cap.
+    cap_raw = os.getenv("PLAYPEN_PER_GAME_MAX_SAMPLES")
+    if cap_raw is not None and cap_raw.strip():
+        cfg["training"]["per_game_max_samples"] = int(cap_raw.strip())
+    return cfg
+
+
 def configure_wandb_env() -> None:
     # Optional local key injection; harmless when not present (e.g., cluster secrets).
     key_path = Path(__file__).resolve().parents[2] / "key.json"
@@ -54,6 +143,44 @@ def configure_wandb_env() -> None:
     except Exception:
         pass
     os.environ.setdefault("WANDB_PROJECT", "llama3-sft-adapters")
+
+
+def resolve_trainer_device():
+    if not torch.cuda.is_available():
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+    local_rank = os.getenv("LOCAL_RANK")
+    if local_rank is not None:
+        try:
+            rank_idx = int(str(local_rank).strip())
+            return torch.device(f"cuda:{rank_idx}")
+        except Exception:
+            pass
+    return torch.device("cuda:0")
+
+
+def sanitize_hf_device_maps(model) -> None:
+    # `accelerate` checks `len(module.hf_device_map)`, so `None` will crash.
+    # Normalize all encountered maps to empty dicts on single-device training.
+    for module in model.modules():
+        if hasattr(module, "hf_device_map"):
+            try:
+                value = getattr(module, "hf_device_map")
+                if not isinstance(value, dict):
+                    setattr(module, "hf_device_map", {})
+            except Exception:
+                pass
+        if hasattr(module, "device_map"):
+            try:
+                value = getattr(module, "device_map")
+                if value is None:
+                    continue
+                # Keep only dict/None semantics; drop odd leftovers.
+                if not isinstance(value, dict):
+                    setattr(module, "device_map", None)
+            except Exception:
+                pass
 
 
 def _safe_slug(value: str) -> str:
@@ -99,21 +226,25 @@ def export_adapter_registry_snapshot(base_model_spec: dict, trained_runs: list) 
     if not isinstance(base_spec, dict):
         raise ValueError("Invalid base model spec for registry export.")
     base_name = str(base_spec.get("model_name") or "model")
-    base_config = dict(base_spec.get("model_config") or {})
-    base_config.pop("peft_model", None)
-    base_config.pop("peft_models", None)
-    base_config.pop("merge", None)
+
+    # Prefer the raw source registry entry as template to preserve all metadata fields.
+    source_template = None
+    for item in source_entries:
+        if isinstance(item, dict) and str(item.get("model_name")) == base_name:
+            source_template = copy.deepcopy(item)
+            break
 
     new_entries = []
     for run in trained_runs:
         run_suffix = str(run["run_suffix"])
         model_name = f"{base_name}-sft" if run_suffix == "all" else f"{base_name}-sft-{run_suffix}"
 
-        entry = copy.deepcopy(base_spec)
+        entry = copy.deepcopy(source_template if source_template is not None else base_spec)
         entry.pop("lookup_source", None)
         entry["model_name"] = model_name
 
-        model_config = dict(base_config)
+        # Keep template model_config intact; only update peft_model path for this run.
+        model_config = dict(entry.get("model_config") or {})
         model_config["peft_model"] = str(run["adapter_ref"])
         entry["model_config"] = model_config
         new_entries.append(entry)
@@ -256,6 +387,9 @@ class PeftSftTrainer(BasePlayPen):
 
     def learn(self, game_registry: GameRegistry):
         configure_wandb_env()
+        sft_cfg = load_sft_config()
+        train_cfg = sft_cfg["training"]
+        lora_cfg_raw = sft_cfg["lora"]
         combined_train, combined_val = build_and_summarize_datasets()
 
         def sanitize_game_name(game_name: str) -> str:
@@ -263,6 +397,7 @@ class PeftSftTrainer(BasePlayPen):
             return slug or "unknown"
 
         # Prepare per-game datasets (one adapter per game).
+        per_game_max_samples = int(train_cfg["per_game_max_samples"])
         game_train_datasets = {}
         game_eval_datasets = {}
         for game_name in sorted(set(combined_train["game_name_normalized"])):
@@ -271,7 +406,18 @@ class PeftSftTrainer(BasePlayPen):
                 load_from_cache_file=False,
             )
             if len(filtered):
-                game_train_datasets[game_name] = filtered
+                if len(filtered) > per_game_max_samples:
+                    capped = filtered.shuffle(seed=42).select(range(per_game_max_samples))
+                    print(
+                        f"[game={game_name}] train samples capped to {len(capped)} "
+                        f"(from {len(filtered)})"
+                    )
+                    game_train_datasets[game_name] = capped
+                else:
+                    print(
+                        f"[game={game_name}] train samples using all available rows: {len(filtered)}"
+                    )
+                    game_train_datasets[game_name] = filtered
             eval_subset = combined_val.filter(
                 lambda example, gname=game_name: example["game_name_normalized"] == gname,
                 load_from_cache_file=False,
@@ -293,21 +439,30 @@ class PeftSftTrainer(BasePlayPen):
             # Decide schedule based on dataset size (more epochs for smaller per-game datasets)
             is_game = run_suffix.startswith("game_")
 
-            # Effective batch size: 2 * 8 = 16 episodes/step
-            eff_batch_size = 2 * 8
+            # Effective batch size = train batch * grad accumulation.
+            train_bs = int(train_cfg["per_device_train_batch_size"])
+            eval_bs = int(train_cfg["per_device_eval_batch_size"])
+            grad_acc = int(train_cfg["gradient_accumulation_steps"])
+            eff_batch_size = train_bs * grad_acc
             steps_per_epoch = max(1, math.ceil(total_samples / eff_batch_size))
 
-            learning_rate = 5e-6  # same LR for all adapters
+            learning_rate = float(train_cfg["learning_rate"])
 
             if is_game:
-                if total_samples < 3000:
-                    num_train_epochs = 4.0
-                elif total_samples < 6000:
-                    num_train_epochs = 3.0
+                game_epochs = train_cfg["epochs"]["game"]
+                if isinstance(game_epochs, (int, float, str)):
+                    num_train_epochs = float(game_epochs)
+                elif isinstance(game_epochs, dict):
+                    if total_samples < 3000:
+                        num_train_epochs = float(game_epochs.get("lt_3000", game_epochs.get("default", 4.0)))
+                    elif total_samples < 6000:
+                        num_train_epochs = float(game_epochs.get("lt_6000", game_epochs.get("default", 3.0)))
+                    else:
+                        num_train_epochs = float(game_epochs.get("gte_6000", game_epochs.get("default", 3.0)))
                 else:
-                    num_train_epochs = 3.0
+                    raise ValueError("training.epochs.game must be a number or an object in SFT YAML config.")
             else:
-                num_train_epochs = 2.0
+                num_train_epochs = float(train_cfg["epochs"]["combined"])
 
             approx_steps = int(num_train_epochs * steps_per_epoch)
             print(
@@ -318,36 +473,63 @@ class PeftSftTrainer(BasePlayPen):
             # fresh copy of the base model for every adapter
             model_for_adapter = copy.deepcopy(base_model)
             model_for_adapter = prepare_model_for_trainer(model_for_adapter)
+            train_device = resolve_trainer_device()
+            model_for_adapter = model_for_adapter.to(train_device)
+            sanitize_hf_device_maps(model_for_adapter)
+            print(f"[{run_suffix}] trainer device={train_device}")
 
             run_wandb = wandb is not None and use_wandb()
+            wandb_initialized = False
             # Explicit W&B run per adapter
             wandb_run_name = f"{self.learner.name}-sft-{run_suffix}"
             if run_wandb:
-                wandb.init(
-                    project=os.environ.get("WANDB_PROJECT", "llama3-sft-adapters"),
-                    name=wandb_run_name,
-                    group=f"{self.learner.name}-sft-adapters",
-                    reinit=True,
+                try:
+                    wandb.init(
+                        project=os.environ.get("WANDB_PROJECT", "llama3-sft-adapters"),
+                        name=wandb_run_name,
+                        group=f"{self.learner.name}-sft-adapters",
+                        settings=wandb.Settings(init_timeout=wandb_init_timeout()),
+                    )
+                    wandb_initialized = True
+                except Exception as e:
+                    # Do not fail training on transient/no-network W&B issues.
+                    run_wandb = False
+                    print(
+                        f"W&B init failed for {wandb_run_name} ({type(e).__name__}: {e}). "
+                        "Continuing with report_to='none'."
+                    )
+
+            eval_strategy = str(train_cfg["eval_strategy"])
+            save_strategy = str(train_cfg["save_strategy"])
+            load_best_model_at_end = bool(train_cfg.get("load_best_model_at_end", False))
+            if load_best_model_at_end and save_strategy != eval_strategy:
+                print(
+                    f"[{run_suffix}] load_best_model_at_end requires save_strategy==eval_strategy. "
+                    f"Overriding save_strategy '{save_strategy}' -> '{eval_strategy}'."
                 )
+                save_strategy = eval_strategy
 
             config = trl.SFTConfig(  # inherits TrainingArguments
-                max_length=2048,
-                per_device_train_batch_size=2,
-                per_device_eval_batch_size=2,
-                gradient_accumulation_steps=8,
+                max_length=int(train_cfg["max_length"]),
+                per_device_train_batch_size=train_bs,
+                per_device_eval_batch_size=eval_bs,
+                gradient_accumulation_steps=grad_acc,
                 learning_rate=learning_rate,
                 num_train_epochs=num_train_epochs,
-                lr_scheduler_type="linear",
-                warmup_ratio=0.03,
+                lr_scheduler_type=str(train_cfg["lr_scheduler_type"]),
+                warmup_ratio=float(train_cfg["warmup_ratio"]),
                 bf16=use_bf16(),
-                gradient_checkpointing=True,
-                seed=7331,
+                gradient_checkpointing=bool(train_cfg["gradient_checkpointing"]),
+                seed=int(train_cfg["seed"]),
                 output_dir=output_dir,
-                eval_strategy="epoch",
-                logging_steps=10,
-                save_strategy="steps",
-                save_steps=100,
-                save_total_limit=3,
+                eval_strategy=eval_strategy,
+                logging_steps=int(train_cfg["logging_steps"]),
+                save_strategy=save_strategy,
+                save_steps=int(train_cfg["save_steps"]),
+                save_total_limit=int(train_cfg["save_total_limit"]),
+                load_best_model_at_end=load_best_model_at_end,
+                metric_for_best_model=str(train_cfg.get("metric_for_best_model", "eval_loss")),
+                greater_is_better=bool(train_cfg.get("greater_is_better", False)),
                 report_to="wandb" if run_wandb else "none",
                 run_name=wandb_run_name,
                 logging_dir=f"./logs/{run_suffix}",
@@ -355,12 +537,12 @@ class PeftSftTrainer(BasePlayPen):
 
             # Train LoRA adapters on all linear layers.
             lora_cfg = LoraConfig(
-                r=16,
-                lora_alpha=32,
-                lora_dropout=0.05,
-                target_modules="all-linear",
-                modules_to_save=["lm_head", "embed_tokens"],
-                task_type="CAUSAL_LM",
+                r=int(lora_cfg_raw["r"]),
+                lora_alpha=int(lora_cfg_raw["alpha"]),
+                lora_dropout=float(lora_cfg_raw["dropout"]),
+                target_modules=lora_cfg_raw["target_modules"],
+                modules_to_save=list(lora_cfg_raw["modules_to_save"]),
+                task_type=str(lora_cfg_raw["task_type"]),
             )
 
             trainer = trl.SFTTrainer(
@@ -376,7 +558,7 @@ class PeftSftTrainer(BasePlayPen):
             trainer.model.save_pretrained(output_dir)
 
             # Close this W&B run so the next adapter gets a fresh one
-            if run_wandb:
+            if wandb_initialized:
                 try:
                     wandb.finish()
                 except Exception as e:
@@ -384,16 +566,27 @@ class PeftSftTrainer(BasePlayPen):
 
             return _resolve_adapter_reference(output_dir)
 
+        # Build combined train split from the per-game capped splits.
+        # This makes the "generalist" adapter reflect the same per-game cap.
+        if not game_train_datasets:
+            raise ValueError("No per-game training datasets after filtering/capping.")
+        capped_train_parts = [game_train_datasets[g] for g in sorted(game_train_datasets)]
+        combined_capped_train = concatenate_datasets(capped_train_parts).shuffle(seed=42)
+        print(
+            f"Combined capped train dataset has {len(combined_capped_train)} samples "
+            f"(max {per_game_max_samples} per game)."
+        )
+
         # Job catalog:
-        # - all: one adapter on the full combined dataset
+        # - all: one adapter on the combined per-game capped dataset
         # - game_<name>: one adapter per individual game
         available_jobs = []
         full_eval_dataset = combined_val if len(combined_val) else None
         available_jobs.append(
             {
                 "suffix": "all",
-                "label": "combined",
-                "train_dataset": combined_train,
+                "label": "combined_capped",
+                "train_dataset": combined_capped_train,
                 "eval_dataset": full_eval_dataset,
             }
         )
@@ -413,6 +606,92 @@ class PeftSftTrainer(BasePlayPen):
             raise ValueError("No per-game training jobs are available.")
         print(f"Prepared {len(game_jobs)} per-game adapter jobs.")
 
+        # Cluster adapters built from the same already capped per-game datasets.
+        # This guarantees each game contributes with the same per-game cap policy as game_* adapters.
+        CLUSTER_MAP = {
+            "cluster_wordguessing": [
+                "codenames",
+                "taboo",
+                "guesswhat",
+                "guess_what",
+                "wordle",
+                "wordle_withclue",
+                "wordle_withcritic",
+            ],
+            "cluster_explorationnavigation": [
+                "adventuregame",
+                "textmapworld",
+                "textmapworld_graphreasoning",
+                "textmapworld_specificroom",
+            ],
+            "cluster_cooperation": [
+                "imagegame",
+                "matchit",
+                "matchit_ascii",
+                "referencegame",
+                "privateshared",
+            ],
+        }
+        # cluster_all = union of all above clusters.
+        all_cluster_members = []
+        for members in CLUSTER_MAP.values():
+            all_cluster_members.extend(members)
+        CLUSTER_MAP["cluster_all"] = all_cluster_members
+
+        # Build alias index to robustly resolve minor naming variants (e.g., guesswhat vs guess_what).
+        alias_to_game = {}
+        for game_name in sorted(game_train_datasets):
+            normalized = sanitize_game_name(game_name)
+            alias_to_game[normalized] = game_name
+            alias_to_game[normalized.replace("_", "")] = game_name
+
+        cluster_jobs = []
+        for cluster_suffix, members in CLUSTER_MAP.items():
+            resolved_members = []
+            seen_members = set()
+            for raw_member in members:
+                key = sanitize_game_name(raw_member)
+                candidate = alias_to_game.get(key) or alias_to_game.get(key.replace("_", ""))
+                if candidate is None:
+                    continue
+                if candidate in seen_members:
+                    continue
+                seen_members.add(candidate)
+                resolved_members.append(candidate)
+
+            if not resolved_members:
+                print(f"[cluster={cluster_suffix}] no matching games found in current train split; skipping.")
+                continue
+
+            train_parts = [game_train_datasets[g] for g in resolved_members if g in game_train_datasets]
+            if not train_parts:
+                print(f"[cluster={cluster_suffix}] no train parts after resolution; skipping.")
+                continue
+            cluster_train = concatenate_datasets(train_parts).shuffle(seed=42)
+
+            eval_parts = [game_eval_datasets[g] for g in resolved_members if g in game_eval_datasets]
+            cluster_eval = concatenate_datasets(eval_parts).shuffle(seed=42) if eval_parts else None
+
+            suffix = sanitize_game_name(cluster_suffix)
+            cluster_jobs.append(
+                {
+                    "suffix": suffix,
+                    "label": f"cluster:{cluster_suffix}",
+                    "train_dataset": cluster_train,
+                    "eval_dataset": cluster_eval,
+                }
+            )
+            print(
+                f"[{suffix}] games={','.join(resolved_members)} "
+                f"train_samples={len(cluster_train)} eval_samples={len(cluster_eval) if cluster_eval is not None else 0}"
+            )
+
+        if cluster_jobs:
+            available_jobs.extend(cluster_jobs)
+            print(f"Prepared {len(cluster_jobs)} cluster adapter jobs.")
+        else:
+            print("Prepared 0 cluster adapter jobs.")
+
         # Default training: all per-game adapters (e.g. 14 games -> 14 adapters).
         training_jobs = game_jobs
 
@@ -426,6 +705,12 @@ class PeftSftTrainer(BasePlayPen):
             requested = {target.strip().lower() for target in requested_targets.split(",") if target.strip()}
             if "all-games" in requested:
                 training_jobs = game_jobs
+            elif "cluster-all" in requested or "all-clusters" in requested or "clusters" in requested:
+                if cluster_jobs:
+                    training_jobs = cluster_jobs
+                else:
+                    print("Warning: cluster targets requested but no cluster jobs resolved; falling back to all-games.")
+                    training_jobs = game_jobs
             elif "all" in requested:
                 training_jobs = available_jobs
             elif "combined" in requested or "general" in requested:

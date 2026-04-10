@@ -3,8 +3,9 @@ import inspect
 import importlib.util as importlib_util
 import json
 import os
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Dict, Optional, Tuple, List
+from typing import Any, Dict, Mapping, Optional, Tuple, List
 from datetime import datetime
 
 import clemcore.cli as clem
@@ -12,6 +13,11 @@ from clemcore.backends import ModelSpec, ModelRegistry, BackendRegistry
 from clemcore.clemgame import GameRegistry, GameSpec
 from playpen import BasePlayPen, to_sub_selector
 from playpen.moe import load_moe_config, tasks_by_game_experiment
+from playpen.moe_loss_router import (
+    LossBasedExpertRouter,
+    append_router_log_row,
+    extract_prompt_and_first_target,
+)
 
 
 def train(file_path: str, learner: ModelSpec, teacher: ModelSpec, temperature: float, max_tokens: int):
@@ -174,6 +180,29 @@ def _with_model_registry_file(model_registry_file: Path) -> Optional[callable]:
                 pass
 
     return restore
+
+
+@contextmanager
+def _eval_context_env(*, game: Optional[str] = None, split: Optional[str] = None, regime: Optional[str] = None):
+    keys = {
+        "PLAYPEN_EVAL_GAME": game,
+        "PLAYPEN_EVAL_SPLIT": split,
+        "PLAYPEN_EVAL_REGIME": regime,
+    }
+    previous = {k: os.environ.get(k) for k in keys}
+    try:
+        for key, value in keys.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = str(value)
+        yield
+    finally:
+        for key, old in previous.items():
+            if old is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old
 
 
 def _find_clembench_roots() -> Tuple[Path, ...]:
@@ -376,17 +405,90 @@ def _game_context_text(game: str, experiment: Optional[str], meta_index: Dict[st
     return "\n".join(parts)
 
 
+def _row_get(row: Mapping[str, Any], *keys: str, default=None):
+    for key in keys:
+        if key in row and row.get(key) is not None:
+            return row.get(key)
+    return default
+
+
+def _regime_from_row(row: Mapping[str, Any], id_regimes: Tuple[str, ...]) -> str:
+    raw = _row_get(row, "regime", "domain", "ood", default=None)
+    if raw is None:
+        return "id"
+    text = str(raw).strip().lower()
+    if text in {"0", "false", "id", "in_domain", "in-domain", "indomain"}:
+        return "id"
+    if text in {"1", "true", "ood", "out_domain", "out-of-domain", "outdomain"}:
+        return "ood"
+    if text in {str(x).strip().lower() for x in id_regimes}:
+        return "id"
+    return text
+
+
+def generate_with_selected_expert(
+    *,
+    suite_results_dir: Path,
+    game_name: str,
+    task_id: int,
+    run_spec: ModelSpec,
+    gen_args: Dict,
+    split: str = "validation",
+    regime: str = "unknown",
+):
+    def sub_selector_single(game: str, experiment: str, _g=game_name, _task_id=int(task_id)):
+        if game != _g:
+            return []
+        return [_task_id]
+
+    with _eval_context_env(game=game_name, split=split, regime=regime):
+        _clem_run(game_name, [run_spec], gen_args, suite_results_dir, selector_fn=sub_selector_single)
+
+
 def evaluate_suite(suite: str, model_spec: ModelSpec, gen_args: Dict, results_dir: Path, game_selector: str,
                    dataset_name: str):
     suite_results_dir = results_dir / suite
     if dataset_name is not None:
         from datasets import load_dataset
         dataset = load_dataset("colab-potsdam/playpen-data", dataset_name, split="validation")
-        _clem_run(game_selector, [model_spec], gen_args, suite_results_dir, selector_fn=to_sub_selector(dataset))
+        selector_fn = to_sub_selector(dataset)
+        tasks_by_group = tasks_by_game_experiment(dataset)
+        model_cfg = dict(getattr(model_spec, "model_config", {}) or {})
+        moe_enabled = bool(model_cfg.get("moe_enabled", False))
+        # If user passed an explicit game name (e.g. "-g wordle"), avoid dataset task sub-selection.
+        # Some clemcore versions can otherwise pick up interactions outside that game during scoring.
+        if isinstance(game_selector, str):
+            selector = game_selector.strip()
+            if selector and not selector.startswith("{") and not selector.startswith("["):
+                selector_fn = None
+        if moe_enabled:
+            explicit_game = None
+            if isinstance(game_selector, str):
+                selector = game_selector.strip()
+                if selector and not selector.startswith("{") and not selector.startswith("["):
+                    explicit_game = selector
+
+            if explicit_game is not None:
+                targets = [(g, e) for (g, e) in sorted(tasks_by_group.keys()) if g == explicit_game]
+            else:
+                targets = sorted(tasks_by_group.keys())
+
+            for game_name, experiment_name in targets:
+                def sub_selector_exact(game: str, experiment: str, _g=game_name, _e=experiment_name):
+                    if game == _g and experiment == _e:
+                        return tasks_by_group.get((game, experiment), [])
+                    return []
+
+                with _eval_context_env(game=game_name, split="validation", regime="unknown"):
+                    _clem_run(game_name, [model_spec], gen_args, suite_results_dir, selector_fn=sub_selector_exact)
+        else:
+            context_game = game_selector if isinstance(game_selector, str) else "benchmark"
+            with _eval_context_env(game=context_game, split="validation", regime="unknown"):
+                _clem_run(game_selector, [model_spec], gen_args, suite_results_dir, selector_fn=selector_fn)
     clem.score(game_selector, str(suite_results_dir))
     clem.transcripts(game_selector, str(suite_results_dir))
     df = clem.clemeval.perform_evaluation(str(suite_results_dir), return_dataframe=True)
-    clem_score = df["-, clemscore"][0]
+    clem_score = df["-, clemscore"].iloc[0]
     return clem_score
 
 
@@ -396,7 +498,7 @@ def _extract_clemscore(df, model_name: str) -> float:
         return float(df.loc[model_name, "-, clemscore"])
     except Exception:
         try:
-            return float(df["-, clemscore"][0])
+            return float(df["-, clemscore"].iloc[0])
         except Exception as e:
             raise RuntimeError(f"Could not extract clemscore for model '{model_name}' from evaluation output.") from e
 
@@ -459,6 +561,7 @@ def evaluate_suite_moe(
             game_names = [explicit_game]
         else:
             game_names = sorted({g for (g, _) in tasks_by_group.keys()})
+        game_name_set = set(game_names)
 
         model_registry = ModelRegistry.from_packaged_and_cwd_files()
         moe_entry_exists = True
@@ -470,67 +573,203 @@ def evaluate_suite_moe(
         def sub_selector_all(game: str, experiment: str):
             return tasks_by_group.get((game, experiment), [])
 
-        if moe.route_by_experiment:
-            targets = [(g, e) for (g, e) in sorted(tasks_by_group.keys()) if g in set(game_names)]
-        else:
-            targets = [(g, None) for g in game_names]
+        if moe.loss_router is not None:
+            configured_experts = list(moe.loss_router.experts or [])
+            if not configured_experts:
+                configured_experts = sorted({r.model for r in moe.routes if getattr(r, "model", None)})
+            if not configured_experts:
+                raise ValueError("loss_router is enabled but no experts were configured.")
 
-        for game_name, experiment_name in targets:
-            context_text = _game_context_text(game_name, experiment_name, game_meta_index)
-            expert = moe.select_model(game_name, experiment_name, context_text=context_text)
-            expert_spec = _resolve_registered_model_spec(model_registry, expert)
-            experiment_label = experiment_name if experiment_name is not None else "-"
-            merge_label = merge if merge is not None else "none"
-            print(f"[MoE] suite={suite} game={game_name} experiment={experiment_label} -> expert={expert} (merge={merge_label})")
-
-            # Keep one virtual model name on disk/leaderboard while varying the underlying adapter per call.
-            run_spec = _with_model_name(expert_spec, moe.name)
-
-            extra_cfg = {"moe_expert": expert}
-            if merge is not None:
-                extra_cfg["merge"] = merge
-            run_spec = _with_model_config(run_spec, extra_cfg)
-
-            restore_registry = None
-            if not moe_entry_exists:
-                restore_registry = _with_temp_model_registry_entry(run_spec.to_dict())
-                if restore_registry is not None:
-                    print(f"[MoE] injected temporary model_registry entry for {moe.name}")
-
-            if moe.route_by_experiment and experiment_name is not None:
-                def sub_selector_only(game: str, experiment: str, _g=game_name, _e=experiment_name):
-                    if game == _g and experiment == _e:
-                        return tasks_by_group.get((game, experiment), [])
-                    return []
-
-                try:
-                    _clem_run(game_name, [run_spec], gen_args, suite_results_dir, selector_fn=sub_selector_only)
-                finally:
-                    if restore_registry is not None:
-                        restore_registry()
-            else:
-                try:
-                    _clem_run(game_name, [run_spec], gen_args, suite_results_dir, selector_fn=sub_selector_all)
-                finally:
-                    if restore_registry is not None:
-                        restore_registry()
-
-            moe_info = {
-                "moe_name": moe.name,
-                "moe_type": moe_type,
-                "default_model": moe.default_model,
-                "expert_model": expert,
-                "game": game_name,
-                "experiment": experiment_name,
-                "merge": merge_label,
-            }
-            updated = _update_players_model_jsons(suite_results_dir, game_name, moe_info)
-            if updated == 0:
-                print(f"[MoE] warning: no players_model.json found under {suite_results_dir} for game={game_name}")
-
-            routing_manifest["assignments"].append(
-                {"game": game_name, "experiment": experiment_name, "expert_model": expert}
+            loss_router = LossBasedExpertRouter(
+                model_registry=model_registry,
+                base_model_name=moe.default_model,
+                experts=configured_experts,
             )
+            router_log_path = (
+                Path(moe.loss_router.log_path).expanduser()
+                if moe.loss_router.log_path
+                else (results_dir / f"{moe.name}.{suite}.loss_router.jsonl")
+            )
+            oracle_field = str(moe.loss_router.oracle_field or "oracle_expert")
+            id_regimes = tuple(moe.loss_router.id_regimes or ("id",))
+            merge_label = merge if merge is not None else "none"
+
+            for row in dataset:
+                game_name = str(_row_get(row, "game", "game_name", default="") or "")
+                experiment_name = _row_get(row, "experiment", "experiment_name", default=None)
+                experiment_name = str(experiment_name) if experiment_name is not None else None
+                task_id = _row_get(row, "task_id", "game_id", "instance_id", default=None)
+                if not game_name or task_id is None:
+                    continue
+
+                if explicit_game is not None and game_name != explicit_game:
+                    continue
+                if game_name not in game_name_set:
+                    continue
+
+                prompt_text, target_text = extract_prompt_and_first_target(row)
+                if not prompt_text or not target_text:
+                    context_text = _game_context_text(game_name, experiment_name, game_meta_index)
+                    expert = moe.select_model(game_name, experiment_name, context_text=context_text)
+                    scored = {
+                        "selected_expert": expert,
+                        "expert_scores": [],
+                        "margin_to_second_best": float("nan"),
+                        "details": [],
+                    }
+                else:
+                    scored = loss_router.select_expert_by_loss(prompt_text=prompt_text, target_text=target_text)
+                    expert = str(scored["selected_expert"])
+
+                expert_spec = _resolve_registered_model_spec(model_registry, expert)
+                run_spec = _with_model_name(expert_spec, moe.name)
+                extra_cfg = {"moe_expert": expert}
+                if merge is not None:
+                    extra_cfg["merge"] = merge
+                run_spec = _with_model_config(run_spec, extra_cfg)
+
+                restore_registry = None
+                if not moe_entry_exists:
+                    restore_registry = _with_temp_model_registry_entry(run_spec.to_dict())
+                    if restore_registry is not None:
+                        print(f"[MoE] injected temporary model_registry entry for {moe.name}")
+
+                regime = _regime_from_row(row, id_regimes)
+                try:
+                    generate_with_selected_expert(
+                        suite_results_dir=suite_results_dir,
+                        game_name=game_name,
+                        task_id=int(task_id),
+                        run_spec=run_spec,
+                        gen_args=gen_args,
+                        split="validation",
+                        regime=regime,
+                    )
+                finally:
+                    if restore_registry is not None:
+                        restore_registry()
+
+                example_id = str(_row_get(row, "example_id", default=f"{game_name}:{experiment_name}:{task_id}"))
+                oracle_expert = _row_get(row, oracle_field, "oracle_expert", default=None)
+                details = list(scored.get("details") or [])
+                score_map = {
+                    str(item["expert_name"]): float(item["mean_nll"])
+                    for item in details
+                    if isinstance(item, Mapping) and item.get("expert_name") is not None
+                }
+                selected_mean_nll = score_map.get(expert)
+                margin = float(scored.get("margin_to_second_best", float("nan")))
+
+                log_row = {
+                    "example_id": example_id,
+                    "game": game_name,
+                    "experiment": experiment_name,
+                    "task_id": int(task_id),
+                    "split": "validation",
+                    "regime": regime,
+                    "selected_expert": expert,
+                    "oracle_expert": str(oracle_expert) if oracle_expert is not None else None,
+                    "top1_minus_top2_margin": margin,
+                    "selected_mean_nll": selected_mean_nll,
+                    "final_evaluation_score": None,
+                }
+                for expert_name in configured_experts:
+                    log_row[f"mean_nll_{expert_name}"] = score_map.get(expert_name)
+                append_router_log_row(router_log_path, log_row)
+
+                print(
+                    f"[MoE-LossRouter] suite={suite} game={game_name} task_id={task_id} "
+                    f"selected={expert} margin={margin:.6f} merge={merge_label}"
+                )
+
+                moe_info = {
+                    "moe_name": moe.name,
+                    "moe_type": "loss_router",
+                    "default_model": moe.default_model,
+                    "expert_model": expert,
+                    "game": game_name,
+                    "experiment": experiment_name,
+                    "task_id": int(task_id),
+                    "merge": merge_label,
+                }
+                updated = _update_players_model_jsons(suite_results_dir, game_name, moe_info)
+                if updated == 0:
+                    print(f"[MoE] warning: no players_model.json found under {suite_results_dir} for game={game_name}")
+
+                routing_manifest["assignments"].append(
+                    {
+                        "game": game_name,
+                        "experiment": experiment_name,
+                        "task_id": int(task_id),
+                        "expert_model": expert,
+                        "router": "loss_router",
+                    }
+                )
+            routing_manifest["loss_router_log"] = str(router_log_path)
+        else:
+            if moe.route_by_experiment:
+                targets = [(g, e) for (g, e) in sorted(tasks_by_group.keys()) if g in game_name_set]
+            else:
+                targets = [(g, None) for g in game_names]
+
+            for game_name, experiment_name in targets:
+                context_text = _game_context_text(game_name, experiment_name, game_meta_index)
+                expert = moe.select_model(game_name, experiment_name, context_text=context_text)
+                expert_spec = _resolve_registered_model_spec(model_registry, expert)
+                experiment_label = experiment_name if experiment_name is not None else "-"
+                merge_label = merge if merge is not None else "none"
+                print(f"[MoE] suite={suite} game={game_name} experiment={experiment_label} -> expert={expert} (merge={merge_label})")
+
+                # Keep one virtual model name on disk/leaderboard while varying the underlying adapter per call.
+                run_spec = _with_model_name(expert_spec, moe.name)
+
+                extra_cfg = {"moe_expert": expert}
+                if merge is not None:
+                    extra_cfg["merge"] = merge
+                run_spec = _with_model_config(run_spec, extra_cfg)
+
+                restore_registry = None
+                if not moe_entry_exists:
+                    restore_registry = _with_temp_model_registry_entry(run_spec.to_dict())
+                    if restore_registry is not None:
+                        print(f"[MoE] injected temporary model_registry entry for {moe.name}")
+
+                if moe.route_by_experiment and experiment_name is not None:
+                    def sub_selector_only(game: str, experiment: str, _g=game_name, _e=experiment_name):
+                        if game == _g and experiment == _e:
+                            return tasks_by_group.get((game, experiment), [])
+                        return []
+
+                    try:
+                        with _eval_context_env(game=game_name, split="validation", regime="unknown"):
+                            _clem_run(game_name, [run_spec], gen_args, suite_results_dir, selector_fn=sub_selector_only)
+                    finally:
+                        if restore_registry is not None:
+                            restore_registry()
+                else:
+                    try:
+                        with _eval_context_env(game=game_name, split="validation", regime="unknown"):
+                            _clem_run(game_name, [run_spec], gen_args, suite_results_dir, selector_fn=sub_selector_all)
+                    finally:
+                        if restore_registry is not None:
+                            restore_registry()
+
+                moe_info = {
+                    "moe_name": moe.name,
+                    "moe_type": moe_type,
+                    "default_model": moe.default_model,
+                    "expert_model": expert,
+                    "game": game_name,
+                    "experiment": experiment_name,
+                    "merge": merge_label,
+                }
+                updated = _update_players_model_jsons(suite_results_dir, game_name, moe_info)
+                if updated == 0:
+                    print(f"[MoE] warning: no players_model.json found under {suite_results_dir} for game={game_name}")
+
+                routing_manifest["assignments"].append(
+                    {"game": game_name, "experiment": experiment_name, "expert_model": expert}
+                )
 
         manifest_path = results_dir / f"{moe.name}.{suite}.moe.json"
         with open(manifest_path, "w", encoding="utf-8") as f:
