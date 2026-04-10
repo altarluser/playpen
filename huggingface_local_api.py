@@ -10,6 +10,7 @@ import clemcore.backends as backends
 import clemcore.backends.huggingface_local_api as core_hf
 
 from playpen.merge import apply_merge_if_requested
+from playpen.moe_runtime import apply_moe_if_requested
 
 
 logger = core_hf.logger
@@ -18,6 +19,7 @@ stdout_logger = core_hf.stdout_logger
 
 def load_model(model_spec: backends.ModelSpec):
     model = core_hf.load_model(model_spec)
+    model = apply_moe_if_requested(model, model_spec, logger=stdout_logger)
     return apply_merge_if_requested(model, model_spec, logger=stdout_logger)
 
 
