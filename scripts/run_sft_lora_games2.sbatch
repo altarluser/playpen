@@ -55,12 +55,42 @@ module load anaconda3/2023.09
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate playpen
 
-# Pin this process to the first GPU assigned by Slurm so torch/transformers use a single logical cuda:0.
-if [ -n "${SLURM_STEP_GPUS:-}" ]; then
-  export CUDA_VISIBLE_DEVICES="${SLURM_STEP_GPUS%%,*}"
-elif [ -n "${SLURM_JOB_GPUS:-}" ]; then
-  export CUDA_VISIBLE_DEVICES="${SLURM_JOB_GPUS%%,*}"
-fi
+auto_fix_cuda_visible_devices() {
+  if python - <<'PY' >/dev/null 2>&1
+import torch, sys
+sys.exit(0 if torch.cuda.is_available() and torch.cuda.device_count() > 0 else 1)
+PY
+  then
+    return 0
+  fi
+  local raw="${SLURM_STEP_GPUS:-${SLURM_JOB_GPUS:-}}"
+  local first="${raw%%,*}"
+  local idx=""
+  if [ -n "$first" ]; then
+    case "$first" in
+      GPU-*|MIG-*) idx="$first" ;;
+      *) idx="$(printf '%s' "$first" | sed -nE 's/[^0-9]*([0-9]+).*/\1/p')" ;;
+    esac
+  fi
+  local candidates=()
+  [ -n "$idx" ] && candidates+=("$idx")
+  [ -n "$first" ] && candidates+=("$first")
+  candidates+=("0")
+  local cand
+  for cand in "${candidates[@]}"; do
+    if CUDA_VISIBLE_DEVICES="$cand" python - <<'PY' >/dev/null 2>&1
+import torch, sys
+sys.exit(0 if torch.cuda.is_available() and torch.cuda.device_count() > 0 else 1)
+PY
+    then
+      export CUDA_VISIBLE_DEVICES="$cand"
+      return 0
+    fi
+  done
+  echo "ERROR: Could not find a working CUDA_VISIBLE_DEVICES mapping." >&2
+  return 1
+}
+auto_fix_cuda_visible_devices
 
 # Use scratch cache roots consistently for both datasets and models.
 export HF_HOME="$HF_CACHE_ROOT"
@@ -135,9 +165,26 @@ def resolve_snapshot(repo_id: str) -> str:
         p = Path(explicit_snapshot).expanduser()
         if p.exists() and p.is_dir():
             return str(p)
-    pattern = f"models--{repo_id.replace('/', '--')}/snapshots/*"
-    snaps = sorted([p for p in hf_cache_root.glob(pattern) if p.is_dir()])
-    return str(snaps[-1]) if snaps else ""
+    candidates = [repo_id]
+    try:
+        org, model = repo_id.split("/", 1)
+        variants = [model]
+        if model.startswith("Meta-"):
+            variants.append(model[len("Meta-"):])
+        elif not model.startswith("meta-"):
+            variants.append("Meta-" + model)
+        if model.startswith("meta-"):
+            variants.append(model[len("meta-"):])
+        variants = [v for i, v in enumerate(variants) if v and v not in variants[:i]]
+        candidates.extend([f"{org}/{v}" for v in variants])
+    except Exception:
+        pass
+    for cand in candidates:
+        pattern = f"models--{cand.replace('/', '--')}/snapshots/*"
+        snaps = sorted([p for p in hf_cache_root.glob(pattern) if p.is_dir()])
+        if snaps:
+            return str(snaps[-1])
+    return ""
 
 updated = False
 for entry in entries:

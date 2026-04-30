@@ -51,11 +51,42 @@ module load anaconda3/2023.09
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate playpen
 
-if [ -n "${SLURM_STEP_GPUS:-}" ]; then
-  export CUDA_VISIBLE_DEVICES="${SLURM_STEP_GPUS%%,*}"
-elif [ -n "${SLURM_JOB_GPUS:-}" ]; then
-  export CUDA_VISIBLE_DEVICES="${SLURM_JOB_GPUS%%,*}"
-fi
+auto_fix_cuda_visible_devices() {
+  if python - <<'PY' >/dev/null 2>&1
+import torch, sys
+sys.exit(0 if torch.cuda.is_available() and torch.cuda.device_count() > 0 else 1)
+PY
+  then
+    return 0
+  fi
+  local raw="${SLURM_STEP_GPUS:-${SLURM_JOB_GPUS:-}}"
+  local first="${raw%%,*}"
+  local idx=""
+  if [ -n "$first" ]; then
+    case "$first" in
+      GPU-*|MIG-*) idx="$first" ;;
+      *) idx="$(printf '%s' "$first" | sed -nE 's/[^0-9]*([0-9]+).*/\1/p')" ;;
+    esac
+  fi
+  local candidates=()
+  [ -n "$idx" ] && candidates+=("$idx")
+  [ -n "$first" ] && candidates+=("$first")
+  candidates+=("0")
+  local cand
+  for cand in "${candidates[@]}"; do
+    if CUDA_VISIBLE_DEVICES="$cand" python - <<'PY' >/dev/null 2>&1
+import torch, sys
+sys.exit(0 if torch.cuda.is_available() and torch.cuda.device_count() > 0 else 1)
+PY
+    then
+      export CUDA_VISIBLE_DEVICES="$cand"
+      return 0
+    fi
+  done
+  echo "ERROR: Could not find a working CUDA_VISIBLE_DEVICES mapping." >&2
+  return 1
+}
+auto_fix_cuda_visible_devices
 
 export HF_HOME="$HF_CACHE_ROOT"
 export HF_HUB_CACHE="$HF_CACHE_ROOT"
@@ -64,9 +95,11 @@ export TRANSFORMERS_CACHE="$HF_CACHE_ROOT"
 export HF_DATASETS_CACHE="$HF_CACHE_ROOT"
 export NLTK_DATA="${NLTK_DATA:-$HF_CACHE_ROOT/nltk_data}"
 
-: "${HF_HUB_OFFLINE:=0}"
-: "${HF_DATASETS_OFFLINE:=0}"
+: "${HF_HUB_OFFLINE:=1}"
+: "${HF_DATASETS_OFFLINE:=1}"
+HF_LOCAL_SNAPSHOT_FALLBACK="${HF_LOCAL_SNAPSHOT_FALLBACK:-/scratch/usr/bbmaltar/hf-cache/models--meta-llama--Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659}"
 export HF_HUB_OFFLINE HF_DATASETS_OFFLINE
+export HF_LOCAL_SNAPSHOT_FALLBACK
 
 if [ -z "$REGISTRY_PATH" ]; then
   REGISTRY_PATH="$(ls -1t "$REGISTRY_OUT_DIR"/model_registry.*.sft.*.json 2>/dev/null | head -n1 || true)"
@@ -102,6 +135,7 @@ model_group = (os.environ.get("MODEL_GROUP") or "game-adapters").strip().lower()
 model_list_file = Path(os.environ["MODEL_LIST_FILE"])
 hf_cache_root = Path(os.environ["HF_CACHE_ROOT"])
 explicit_snapshot = (os.getenv("HF_LOCAL_SNAPSHOT_PATH") or "").strip()
+fallback_snapshot = (os.getenv("HF_LOCAL_SNAPSHOT_FALLBACK") or "").strip()
 
 payload = json.loads(registry_path.read_text(encoding="utf-8"))
 entries = payload if isinstance(payload, list) else [payload]
@@ -154,11 +188,33 @@ def resolve_snapshot(repo_id: str) -> str:
         p = Path(explicit_snapshot).expanduser()
         if p.exists() and p.is_dir():
             return str(p)
-    pattern = f"models--{repo_id.replace('/', '--')}/snapshots/*"
-    snaps = sorted([p for p in hf_cache_root.glob(pattern) if p.is_dir()])
-    return str(snaps[-1]) if snaps else ""
+    if fallback_snapshot:
+        p = Path(fallback_snapshot).expanduser()
+        if p.exists() and p.is_dir():
+            return str(p)
+    candidates = [repo_id]
+    try:
+        org, model = repo_id.split("/", 1)
+        variants = [model]
+        if model.startswith("Meta-"):
+            variants.append(model[len("Meta-"):])
+        elif not model.startswith("meta-"):
+            variants.append("Meta-" + model)
+        if model.startswith("meta-"):
+            variants.append(model[len("meta-"):])
+        variants = [v for i, v in enumerate(variants) if v and v not in variants[:i]]
+        candidates.extend([f"{org}/{v}" for v in variants])
+    except Exception:
+        pass
+    for cand in candidates:
+        pattern = f"models--{cand.replace('/', '--')}/snapshots/*"
+        snaps = sorted([p for p in hf_cache_root.glob(pattern) if p.is_dir()])
+        if snaps:
+            return str(snaps[-1])
+    return ""
 
 updated = 0
+unresolved = []
 for name in selected:
     entry = entry_by_name[name]
     hf_id = entry.get("huggingface_id")
@@ -171,6 +227,7 @@ for name in selected:
         continue
     snap = resolve_snapshot(hf_id)
     if not snap:
+        unresolved.append(name)
         continue
     entry["huggingface_id"] = snap
     cfg = entry.get("model_config")
@@ -187,6 +244,12 @@ print(f"Selected models: {len(selected)}")
 print(f"Local base path resolved for {updated}/{len(selected)} selected model(s).")
 if updated < len(selected):
     print("Warning: some selected model(s) still reference non-local huggingface_id.")
+if unresolved and str(os.getenv("HF_HUB_OFFLINE", "0")).strip() == "1":
+    raise SystemExit(
+        "ERROR: HF_HUB_OFFLINE=1 and local snapshot resolution failed for: "
+        + ", ".join(unresolved)
+        + ". Set HF_LOCAL_SNAPSHOT_PATH to a local base model snapshot path."
+    )
 PY
 
 mapfile -t MODEL_LIST < "$MODEL_LIST_FILE"

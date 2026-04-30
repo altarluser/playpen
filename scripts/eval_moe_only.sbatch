@@ -45,11 +45,42 @@ module load anaconda3/2023.09
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate playpen
 
-if [ -n "${SLURM_STEP_GPUS:-}" ]; then
-  export CUDA_VISIBLE_DEVICES="${SLURM_STEP_GPUS%%,*}"
-elif [ -n "${SLURM_JOB_GPUS:-}" ]; then
-  export CUDA_VISIBLE_DEVICES="${SLURM_JOB_GPUS%%,*}"
-fi
+auto_fix_cuda_visible_devices() {
+  if python - <<'PY' >/dev/null 2>&1
+import torch, sys
+sys.exit(0 if torch.cuda.is_available() and torch.cuda.device_count() > 0 else 1)
+PY
+  then
+    return 0
+  fi
+  local raw="${SLURM_STEP_GPUS:-${SLURM_JOB_GPUS:-}}"
+  local first="${raw%%,*}"
+  local idx=""
+  if [ -n "$first" ]; then
+    case "$first" in
+      GPU-*|MIG-*) idx="$first" ;;
+      *) idx="$(printf '%s' "$first" | sed -nE 's/[^0-9]*([0-9]+).*/\1/p')" ;;
+    esac
+  fi
+  local candidates=()
+  [ -n "$idx" ] && candidates+=("$idx")
+  [ -n "$first" ] && candidates+=("$first")
+  candidates+=("0")
+  local cand
+  for cand in "${candidates[@]}"; do
+    if CUDA_VISIBLE_DEVICES="$cand" python - <<'PY' >/dev/null 2>&1
+import torch, sys
+sys.exit(0 if torch.cuda.is_available() and torch.cuda.device_count() > 0 else 1)
+PY
+    then
+      export CUDA_VISIBLE_DEVICES="$cand"
+      return 0
+    fi
+  done
+  echo "ERROR: Could not find a working CUDA_VISIBLE_DEVICES mapping." >&2
+  return 1
+}
+auto_fix_cuda_visible_devices
 
 export HF_HOME="$HF_CACHE_ROOT"
 export HF_HUB_CACHE="$HF_CACHE_ROOT"

@@ -21,3 +21,6 @@ model_registries/
 trainer*.py
 .venv/
 .venv/
+*.sbatch
+*.sh
+local_datasets

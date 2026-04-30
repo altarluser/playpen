@@ -54,18 +54,30 @@ class MoeConfig:
     loss_router: Optional["LossRouterConfig"] = None
 
     def select_model(self, game: str, experiment: Optional[str] = None, *, context_text: str = "") -> str:
+        selected: Optional[str] = None
         for route in self.routes:
             if route.matches(game, experiment, context_text):
-                return route.model
+                selected = route.model
+                break
 
-        if self.router is not None and context_text:
+        if selected is None and self.router is not None and context_text:
             router = load_text_router(self.router.path)
             predicted, confidence = router.predict(context_text)
             if predicted is not None:
                 if confidence is None or confidence >= self.router.min_confidence:
-                    return predicted
+                    selected = predicted
 
-        return self.default_model
+        if selected is None:
+            raise ValueError(
+                f"MoE routing produced no expert for game='{game}' experiment='{experiment}'. "
+                "Default/base fallback is disabled; add an explicit route or router coverage."
+            )
+        if str(selected) == str(self.default_model):
+            raise ValueError(
+                f"MoE selected default/base model '{self.default_model}', which is disallowed. "
+                "Route to adapter experts only."
+            )
+        return str(selected)
 
 
 @dataclass(frozen=True)

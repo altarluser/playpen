@@ -13,7 +13,7 @@ import torch
 
 class EvalRoutingLogger:
     def __init__(self, log_dir: str, num_experts: int, flush_every: int = 8):
-        self.log_dir = Path(log_dir).expanduser()
+        self.log_dir = Path(log_dir).expanduser().resolve(strict=False)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.step_log_path = self.log_dir / "routing_steps.jsonl"
         self.summary_path = self.log_dir / "routing_summary.json"
@@ -25,6 +25,9 @@ class EvalRoutingLogger:
         self.cumulative: Dict[int, Dict[str, object]] = {}
         self.context_cumulative: Dict[Tuple[str, str, str, int], Dict[str, object]] = {}
         atexit.register(self.close)
+
+    def _ensure_log_dir(self) -> None:
+        self.log_dir.mkdir(parents=True, exist_ok=True)
 
     def _empty_stats(self) -> Dict[str, object]:
         return {
@@ -85,6 +88,7 @@ class EvalRoutingLogger:
     def flush_buffer(self) -> None:
         if not self.buffer:
             return
+        self._ensure_log_dir()
         payload = {"forward_call": int(self.forward_calls), "layers": {}}
         has_any = False
         for layer_idx in sorted(self.buffer):
@@ -109,6 +113,7 @@ class EvalRoutingLogger:
                 f.write(json.dumps(payload) + "\n")
 
     def export_summary(self) -> None:
+        self._ensure_log_dir()
         summary = {"layers": {}, "global": {}}
         global_top1 = [0.0] * self.num_experts
         total_tokens = 0.0

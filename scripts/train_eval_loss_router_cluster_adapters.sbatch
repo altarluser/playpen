@@ -68,11 +68,42 @@ module load anaconda3/2023.09
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate playpen
 
-if [ -n "${SLURM_STEP_GPUS:-}" ]; then
-  export CUDA_VISIBLE_DEVICES="${SLURM_STEP_GPUS%%,*}"
-elif [ -n "${SLURM_JOB_GPUS:-}" ]; then
-  export CUDA_VISIBLE_DEVICES="${SLURM_JOB_GPUS%%,*}"
-fi
+auto_fix_cuda_visible_devices() {
+  if python - <<'PY' >/dev/null 2>&1
+import torch, sys
+sys.exit(0 if torch.cuda.is_available() and torch.cuda.device_count() > 0 else 1)
+PY
+  then
+    return 0
+  fi
+  local raw="${SLURM_STEP_GPUS:-${SLURM_JOB_GPUS:-}}"
+  local first="${raw%%,*}"
+  local idx=""
+  if [ -n "$first" ]; then
+    case "$first" in
+      GPU-*|MIG-*) idx="$first" ;;
+      *) idx="$(printf '%s' "$first" | sed -nE 's/[^0-9]*([0-9]+).*/\1/p')" ;;
+    esac
+  fi
+  local candidates=()
+  [ -n "$idx" ] && candidates+=("$idx")
+  [ -n "$first" ] && candidates+=("$first")
+  candidates+=("0")
+  local cand
+  for cand in "${candidates[@]}"; do
+    if CUDA_VISIBLE_DEVICES="$cand" python - <<'PY' >/dev/null 2>&1
+import torch, sys
+sys.exit(0 if torch.cuda.is_available() and torch.cuda.device_count() > 0 else 1)
+PY
+    then
+      export CUDA_VISIBLE_DEVICES="$cand"
+      return 0
+    fi
+  done
+  echo "ERROR: Could not find a working CUDA_VISIBLE_DEVICES mapping." >&2
+  return 1
+}
+auto_fix_cuda_visible_devices
 
 export HF_HOME="$HF_CACHE_ROOT"
 export HF_HUB_CACHE="$HF_CACHE_ROOT"
@@ -81,9 +112,11 @@ export TRANSFORMERS_CACHE="$HF_CACHE_ROOT"
 export HF_DATASETS_CACHE="$HF_CACHE_ROOT"
 export NLTK_DATA="${NLTK_DATA:-$HF_CACHE_ROOT/nltk_data}"
 
-: "${HF_HUB_OFFLINE:=0}"
-: "${HF_DATASETS_OFFLINE:=0}"
+: "${HF_HUB_OFFLINE:=1}"
+: "${HF_DATASETS_OFFLINE:=1}"
+HF_LOCAL_SNAPSHOT_FALLBACK="${HF_LOCAL_SNAPSHOT_FALLBACK:-/scratch/usr/bbmaltar/hf-cache/models--meta-llama--Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659}"
 export HF_HUB_OFFLINE HF_DATASETS_OFFLINE
+export HF_LOCAL_SNAPSHOT_FALLBACK
 
 touch "$REPO_DIR/clembench.log"
 cat > "$REPO_DIR/game_registry.json" <<'JSON'
@@ -111,6 +144,20 @@ echo "EVAL_CLUSTER_SUFFIXES=$EVAL_CLUSTER_SUFFIXES"
 echo "ROUTER_EXPERT_SUFFIXES=$ROUTER_EXPERT_SUFFIXES"
 echo "Results root: $RESULTS_ROOT"
 nvidia-smi || true
+python - <<'PY'
+import os
+try:
+    import torch
+    print(
+        f"torch.cuda.is_available={torch.cuda.is_available()} "
+        f"device_count={torch.cuda.device_count()} "
+        f"CUDA_VISIBLE_DEVICES={os.getenv('CUDA_VISIBLE_DEVICES', '<unset>')}"
+    )
+    if torch.cuda.is_available():
+        print(f"torch.cuda.get_device_name(0)={torch.cuda.get_device_name(0)}")
+except Exception as exc:
+    print(f"torch CUDA probe failed: {exc}")
+PY
 
 # Build runtime model registry with local base snapshot when possible.
 BASE_REGISTRY="$BASE_REGISTRY" \
@@ -127,6 +174,7 @@ runtime_registry = Path(os.environ["RUNTIME_REGISTRY"])
 learner_model = os.environ["LEARNER_MODEL"]
 hf_cache_root = Path(os.environ["HF_CACHE_ROOT"])
 explicit_snapshot = (os.getenv("HF_LOCAL_SNAPSHOT_PATH") or "").strip()
+fallback_snapshot = (os.getenv("HF_LOCAL_SNAPSHOT_FALLBACK") or "").strip()
 
 payload = json.loads(base_registry.read_text(encoding="utf-8"))
 entries = payload if isinstance(payload, list) else [payload]
@@ -136,9 +184,30 @@ def resolve_snapshot(repo_id: str) -> str:
         p = Path(explicit_snapshot).expanduser()
         if p.exists() and p.is_dir():
             return str(p)
-    pattern = f"models--{repo_id.replace('/', '--')}/snapshots/*"
-    snaps = sorted([p for p in hf_cache_root.glob(pattern) if p.is_dir()])
-    return str(snaps[-1]) if snaps else ""
+    if fallback_snapshot:
+        p = Path(fallback_snapshot).expanduser()
+        if p.exists() and p.is_dir():
+            return str(p)
+    candidates = [repo_id]
+    try:
+        org, model = repo_id.split("/", 1)
+        variants = [model]
+        if model.startswith("Meta-"):
+            variants.append(model[len("Meta-"):])
+        elif not model.startswith("meta-"):
+            variants.append("Meta-" + model)
+        if model.startswith("meta-"):
+            variants.append(model[len("meta-"):])
+        variants = [v for i, v in enumerate(variants) if v and v not in variants[:i]]
+        candidates.extend([f"{org}/{v}" for v in variants])
+    except Exception:
+        pass
+    for cand in candidates:
+        pattern = f"models--{cand.replace('/', '--')}/snapshots/*"
+        snaps = sorted([p for p in hf_cache_root.glob(pattern) if p.is_dir()])
+        if snaps:
+            return str(snaps[-1])
+    return ""
 
 updated = False
 for entry in entries:
@@ -171,6 +240,11 @@ print(f"Runtime registry written: {runtime_registry}")
 if updated:
     print(f"Updated {learner_model} to local snapshot path.")
 else:
+    if str(os.getenv("HF_HUB_OFFLINE", "0")).strip() == "1":
+        raise SystemExit(
+            "ERROR: HF_HUB_OFFLINE=1 but local base snapshot was not resolved. "
+            "Set HF_LOCAL_SNAPSHOT_PATH to your local Llama snapshot path."
+        )
     print("Warning: base model path not converted to local snapshot.")
 PY
 

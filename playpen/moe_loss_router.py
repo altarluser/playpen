@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -49,7 +50,42 @@ def _adapter_path_for_expert(spec: ModelSpec) -> str:
         raise ValueError(
             f"Expert '{spec.model_name}' does not define model_config.peft_model required for explicit LoRA routing."
         )
-    return str(path)
+    raw = Path(str(path)).expanduser()
+    candidates: List[Path] = [raw]
+    if not raw.is_absolute():
+        candidates.append(Path.cwd() / raw)
+        repo_root = Path(__file__).resolve().parent.parent
+        candidates.append(repo_root / raw)
+        env_repo = os.getenv("PLAYPEN_REPO_DIR")
+        if env_repo:
+            candidates.append(Path(env_repo).expanduser() / raw)
+        env_adapter_root = os.getenv("PLAYPEN_ADAPTER_ROOT")
+        if env_adapter_root:
+            adapter_root = Path(env_adapter_root).expanduser()
+            normalized = str(raw).replace("\\", "/")
+            if normalized.startswith("models/sft+lora/"):
+                rel = Path(normalized[len("models/sft+lora/"):])
+                candidates.append(adapter_root / rel)
+                if rel.parts and adapter_root.name == rel.parts[0]:
+                    candidates.append(adapter_root / Path(*rel.parts[1:]))
+            else:
+                candidates.append(adapter_root / raw)
+
+    seen = set()
+    for cand in candidates:
+        key = str(cand)
+        if key in seen:
+            continue
+        seen.add(key)
+        cfg_path = cand / "adapter_config.json"
+        if cand.exists() and cand.is_dir() and cfg_path.exists():
+            return str(cand)
+
+    tried = ", ".join(str(c) for c in candidates)
+    raise FileNotFoundError(
+        f"Expert '{spec.model_name}' adapter path not found for peft_model={path}. "
+        f"Tried: [{tried}]"
+    )
 
 
 @dataclass
@@ -113,6 +149,47 @@ class LossBasedExpertRouter:
         tok_max = int(getattr(self.tokenizer, "model_max_length", 0) or 0)
         candidates = [x for x in (cfg_max, tok_max) if x and x < 10_000_000]
         return max(candidates) if candidates else 2048
+
+    @torch.no_grad()
+    def generate_initial_answer(
+        self,
+        expert_name: str,
+        prompt_text: str,
+        *,
+        max_new_tokens: int = 64,
+        temperature: float = 0.0,
+    ) -> str:
+        if expert_name not in self._adapter_key_by_name:
+            raise ValueError(f"Unknown expert '{expert_name}' for loss router.")
+
+        adapter_key = self._adapter_key_by_name[expert_name]
+        self._adapter_model.set_adapter(adapter_key)
+
+        prompt_ids = self.tokenizer(
+            prompt_text or "",
+            return_tensors="pt",
+            add_special_tokens=True,
+            truncation=False,
+        )["input_ids"].to(self.device)
+
+        max_len = self._max_context_len()
+        if prompt_ids.shape[1] >= max_len:
+            prompt_ids = prompt_ids[:, -max_len:]
+
+        do_sample = float(temperature) > 0.0
+        gen_kwargs = {
+            "max_new_tokens": max(1, int(max_new_tokens)),
+            "do_sample": do_sample,
+            "temperature": float(temperature) if do_sample else None,
+            "pad_token_id": getattr(self.tokenizer, "pad_token_id", None),
+            "eos_token_id": getattr(self.tokenizer, "eos_token_id", None),
+        }
+        out_ids = self._adapter_model.generate(prompt_ids, **gen_kwargs)
+        gen_ids = out_ids[:, prompt_ids.shape[1] :]
+        if gen_ids.numel() == 0:
+            return ""
+        text = self.tokenizer.decode(gen_ids[0], skip_special_tokens=True)
+        return str(text).strip()
 
     @torch.no_grad()
     def score_expert_nll(
@@ -192,6 +269,37 @@ class LossBasedExpertRouter:
             "details": scores,
         }
 
+    @torch.no_grad()
+    def select_expert_from_prompt(
+        self,
+        prompt_text: str,
+        *,
+        max_new_tokens: int = 64,
+        temperature: float = 0.0,
+    ) -> Dict[str, object]:
+        scores = []
+        for expert in self.experts:
+            candidate = self.generate_initial_answer(
+                expert,
+                prompt_text,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+            )
+            scored = self.score_expert_nll(expert, prompt_text, candidate)
+            scored["candidate_text"] = candidate
+            scores.append(scored)
+        scores.sort(key=lambda x: float(x["mean_nll"]))
+        best = scores[0]
+        second = scores[1] if len(scores) > 1 else None
+        margin = float(second["mean_nll"] - best["mean_nll"]) if second is not None else float("nan")
+        compact = [{"expert_name": s["expert_name"], "mean_nll": float(s["mean_nll"])} for s in scores]
+        return {
+            "selected_expert": str(best["expert_name"]),
+            "expert_scores": compact,
+            "margin_to_second_best": margin,
+            "details": scores,
+        }
+
 
 def extract_prompt_and_first_target(example: Mapping[str, object]) -> Tuple[str, str]:
     messages = example.get("messages") or example.get("chat") or []
@@ -217,12 +325,25 @@ def extract_prompt_and_first_target(example: Mapping[str, object]) -> Tuple[str,
         if target_text:
             return "\n\n".join(prompt_lines).strip(), target_text.strip()
 
-    prompt = str(example.get("prompt") or example.get("context") or "")
+    prompt = str(
+        example.get("prompt")
+        or example.get("context")
+        or example.get("instruction")
+        or example.get("user_prompt")
+        or example.get("input")
+        or ""
+    )
     target = str(
         example.get("target")
         or example.get("response")
         or example.get("first_assistant")
         or example.get("gold_response")
+        or example.get("expected_response")
+        or example.get("answer")
+        or example.get("reference")
+        or example.get("solution")
+        or example.get("target_word")
+        or example.get("target_label")
         or ""
     )
     return prompt.strip(), target.strip()

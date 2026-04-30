@@ -215,8 +215,15 @@ def _safe_slug(value: str) -> str:
     return slug or "model"
 
 
+def _adapter_model_root(learner_name: str) -> Path:
+    configured = str(os.getenv("PLAYPEN_ADAPTER_ROOT", "")).strip()
+    if configured:
+        return Path(configured).expanduser().resolve(strict=False)
+    return (Path("models/sft+lora") / f"{learner_name}-adapters").resolve(strict=False)
+
+
 def _resolve_adapter_reference(output_dir: str) -> str:
-    out_dir = Path(output_dir)
+    out_dir = Path(output_dir).expanduser().resolve(strict=False)
     checkpoint_dirs = []
     for p in out_dir.glob("checkpoint-*"):
         if not p.is_dir():
@@ -474,7 +481,7 @@ class RoutingStatsManager:
     def __init__(self, layer_indices: List[int], num_experts: int, output_dir: Path):
         self.layer_indices = list(layer_indices)
         self.num_experts = int(num_experts)
-        self.output_dir = Path(output_dir)
+        self.output_dir = Path(output_dir).expanduser().resolve(strict=False)
         self.routing_dir = self.output_dir / "routing"
         self.routing_dir.mkdir(parents=True, exist_ok=True)
 
@@ -495,6 +502,9 @@ class RoutingStatsManager:
                 "gate_mass": [0.0] * self.num_experts,
                 "entropy_sum": 0.0,
             }
+
+    def _ensure_log_dirs(self) -> None:
+        self.routing_dir.mkdir(parents=True, exist_ok=True)
 
     def _reset_step(self):
         self.step_stats = {}
@@ -579,6 +589,7 @@ class RoutingStatsManager:
     def flush_step(self, step: int):
         if not any(self.step_stats[layer]["tokens"] > 0 for layer in self.layer_indices):
             return
+        self._ensure_log_dirs()
 
         token_payload = {"step": int(step), "layers": {}}
         for layer_idx in self.layer_indices:
@@ -638,6 +649,7 @@ class RoutingStatsManager:
             plt.close()
 
     def export_summary(self):
+        self._ensure_log_dirs()
         summary = {"layers": {}, "global": {}}
         global_top1 = [0.0] * self.num_experts
         total_tokens = 0.0
@@ -1065,7 +1077,7 @@ class PeftResidualMoESftTrainer(BasePlayPen):
         base_model.eval()
 
         run_suffix = str(moe_cfg.get("run_suffix", "moe-residual"))
-        output_dir = f"models/sft+lora/{self.learner.name}-adapters/{run_suffix}"
+        output_dir = str((_adapter_model_root(self.learner.name) / run_suffix).resolve(strict=False))
         train_device = resolve_trainer_device()
         print(f"[{run_suffix}] trainer device={train_device}")
 
