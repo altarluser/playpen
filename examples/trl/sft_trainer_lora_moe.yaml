@@ -1,0 +1,45 @@
+training:
+  per_game_max_samples: all
+  max_length: 2048
+  per_device_train_batch_size: 2
+  per_device_eval_batch_size: 2
+  gradient_accumulation_steps: 8
+  learning_rate: 5.0e-5
+  learning_rates:
+    lora: 1.0e-5
+    experts: 2.0e-5
+    routers: 5.0e-5
+  num_train_epochs: 3.0
+  lr_scheduler_type: linear
+  warmup_ratio: 0.03
+  gradient_checkpointing: true
+  seed: 7331
+  eval_strategy: epoch
+  logging_steps: 10
+  save_strategy: steps
+  save_steps: 100
+  save_total_limit: 3
+  load_best_model_at_end: false
+  metric_for_best_model: eval_loss
+  greater_is_better: false
+
+moe:
+  num_moe_layers: 6
+  num_experts: 8
+  top_k: 2
+  expert_hidden_size: 2048
+  activation: silu
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+  task_type: CAUSAL_LM
+
+routing:
+  flush_every_steps: 1

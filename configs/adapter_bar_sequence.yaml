@@ -1,0 +1,89 @@
+adapter_bar_sequence:
+  enabled: true
+  split_seed: 42
+  examples_per_game_train: 100
+  examples_per_game_validation: 20
+  strict_label_matching: true
+
+  router_pooling: last_token
+  router_hidden_size: 512
+  router_dropout: 0.1
+  router_lr: 1.0e-4
+  router_batch_size: 16
+  router_num_epochs: 3
+
+  adapter_loading:
+    preload_adapters: false
+    strategy: lru_cache
+    max_active_adapters: 2
+
+  cluster:
+    enabled: true
+    expert_level: cluster
+    output_dir: outputs/adapter_bar_sequence/cluster
+    expert_names:
+      - wordguessing
+      - explorationnavigation
+      - cooperation
+    expert_adapter_paths:
+      wordguessing: path/to/cluster_wordguessing
+      explorationnavigation: path/to/cluster_explorationnavigation
+      cooperation: path/to/cluster_cooperation
+    game_to_cluster:
+      codenames: wordguessing
+      taboo: wordguessing
+      guesswhat: wordguessing
+      wordle: wordguessing
+      wordle_withclue: wordguessing
+      wordle_withcritic: wordguessing
+      imagegame: cooperation
+      matchit_ascii: cooperation
+      referencegame: cooperation
+      privateshared: cooperation
+      textmapworld: explorationnavigation
+      textmapworld_graphreasoning: explorationnavigation
+      textmapworld_specificroom: explorationnavigation
+      adventuregame: explorationnavigation
+    adapter_loading:
+      preload_adapters: true
+      strategy: lru_cache
+      max_active_adapters: 3
+
+  game:
+    enabled: true
+    expert_level: game
+    output_dir: outputs/adapter_bar_sequence/game
+    expert_names:
+      - codenames
+      - taboo
+      - guesswhat
+      - wordle
+      - wordle_withclue
+      - wordle_withcritic
+      - imagegame
+      - matchit_ascii
+      - referencegame
+      - privateshared
+      - textmapworld
+      - textmapworld_graphreasoning
+      - textmapworld_specificroom
+      - adventuregame
+    expert_adapter_paths:
+      codenames: path/to/game_codenames
+      taboo: path/to/game_taboo
+      guesswhat: path/to/game_guesswhat
+      wordle: path/to/game_wordle
+      wordle_withclue: path/to/game_wordle_withclue
+      wordle_withcritic: path/to/game_wordle_withcritic
+      imagegame: path/to/game_imagegame
+      matchit_ascii: path/to/game_matchit_ascii
+      referencegame: path/to/game_referencegame
+      privateshared: path/to/game_privateshared
+      textmapworld: path/to/game_textmapworld
+      textmapworld_graphreasoning: path/to/game_textmapworld_graphreasoning
+      textmapworld_specificroom: path/to/game_textmapworld_specificroom
+      adventuregame: path/to/game_adventuregame
+    adapter_loading:
+      preload_adapters: false
+      strategy: lru_cache
+      max_active_adapters: 2

@@ -1,0 +1,20 @@
+{
+  "name": "llama3-8b-moe",
+  "default_model": "llama3-8b",
+  "game_map": {
+    "adventuregame": "llama3-8b-exploration_navigation-588",
+    "codenames": "llama3-8b-wordguessing",
+    "guesswhat": "llama3-8b-wordguessing",
+    "imagegame": "llama3-8b-cooperation-876",
+    "matchit_ascii": "llama3-8b-cooperation-876",
+    "privateshared": "llama3-8b-cooperation-876",
+    "referencegame": "llama3-8b-cooperation-876",
+    "taboo": "llama3-8b-wordguessing",
+    "textmapworld": "llama3-8b-exploration_navigation-588",
+    "textmapworld_graphreasoning": "llama3-8b-exploration_navigation-588",
+    "textmapworld_specificroom": "llama3-8b-exploration_navigation-588",
+    "wordle": "llama3-8b-wordguessing",
+    "wordle_withclue": "llama3-8b-wordguessing",
+    "wordle_withcritic": "llama3-8b-wordguessing"
+  }
+}

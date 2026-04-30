@@ -66,6 +66,21 @@ playpen eval <model-name>
 ```
 
 where `<model-name>` should match your model's name as specified in the model registry.
+By default, `playpen eval` resolves models from `./model_registry.json`.
+
+If you want to evaluate with a different registry file (without changing your default one), use:
+```bash
+python -m playpen.cli eval <model-name> --model-registry path/to/model_registry.json
+```
+
+For example, this is useful for testing a single local checkpoint:
+```bash
+python -m playpen.cli eval smol-135m-ck63 \
+  --suite static \
+  -g ifeval \
+  --model-registry model_registries/model_registry.smol_ck63.json \
+  -r playpen-eval/smoke-smol-ck63
+```
 
 This will produce a `<model-name>.val.json` file which contains two numbers:
 
@@ -84,6 +99,69 @@ You can also skip the gameplay and only re-compute the scores, if needed, by usi
 ```bash
 playpen eval llama3-8b --skip_gameplay -r playpen-eval/2025-07-04T09-37-23/
 ```
+
+### Merge multiple adapters during eval
+
+If a model spec contains multiple LoRA adapters (`peft_models`), you can merge them at runtime during eval:
+
+```json
+{
+  "model_name": "llama3-8b-merge",
+  "backend": "huggingface_local",
+  "huggingface_id": "meta-llama/Meta-Llama-3.1-8B-Instruct",
+  "model_config": {
+    "peft_models": [
+      "models/sft+lora/llama3-8b-adapters/game_wordle/checkpoint-100",
+      "models/sft+lora/llama3-8b-adapters/game_taboo/checkpoint-120"
+    ],
+    "merge_weights": [0.5, 0.5],
+    "requires_api_key": true,
+    "premade_chat_template": true,
+    "eos_to_cull": "<\\|eot_id\\|>"
+  }
+}
+```
+
+Then choose a merge method on eval:
+```bash
+playpen eval llama3-8b-merge --merge task_arithmetic
+```
+
+Supported merge methods:
+- `task_arithmetic`
+- `weight_averaging`
+- `ties`
+
+Optional `ties` parameters in `model_config`:
+- `ties_k` (default: `0.20`)
+- `ties_lambda` (default: `1.0`)
+- `ties_sample_size` (default: `200000`)
+
+### Mixture-of-Experts (MoE) routing in eval
+
+You can route different games (or experiments) to different expert models with `--moe`.
+The positional `model` argument acts as the virtual routed model name in outputs.
+
+Example MoE config file:
+```json
+{
+  "name": "llama3-8b-moe",
+  "default_model": "llama3-8b",
+  "route_by_experiment": false,
+  "routes": [
+    {"game": "wordle*", "model": "llama3-8b-wordguessing"},
+    {"game": "adventuregame", "model": "llama3-8b-navigation"},
+    {"game": "*", "model": "llama3-8b-cooperation"}
+  ]
+}
+```
+
+Run eval with routing:
+```bash
+playpen eval llama3-8b-moe --moe examples/moe/llama3-8b-moe.json
+```
+
+In this case, the selected merge method is applied to each chosen expert model.
 
 # Examples
 
@@ -169,13 +247,40 @@ The following commands runs the example training pipeline:
 playpen run examples/trl/sft_trainer_lora.py -l llama3-8b 
 ```
 
-The `playpen` CLI properly loads the huggingface model and runs the trainer code in the specified file. 
-When the command finished successfully, then there will be a `models/sft+lora/llama3-8b` directory 
-containing a checkpoint folder, e.g. `checkpoint-78` **containing only the adapter parameters**.
+`examples/trl/sft_trainer_lora.py` trains one adapter per game by default.
+Common target selectors:
+```bash
+# default: train all per-game adapters
+playpen run examples/trl/sft_trainer_lora.py -l llama3-8b
+
+# explicit all per-game adapters
+PLAYPEN_TRAIN_TARGETS=all-games playpen run examples/trl/sft_trainer_lora.py -l llama3-8b
+
+# one game only
+PLAYPEN_TRAIN_TARGETS=wordle playpen run examples/trl/sft_trainer_lora.py -l llama3-8b
+
+# one combined adapter across all games
+PLAYPEN_TRAIN_TARGETS=combined playpen run examples/trl/sft_trainer_lora.py -l llama3-8b
+```
+
+For local test runs (e.g., on MPS) you can disable bf16:
+```bash
+PLAYPEN_BF16=false playpen run examples/trl/sft_trainer_lora.py -l llama3-8b
+```
+
+To only print dataset statistics (no training):
+```bash
+python examples/trl/sft_trainer_lora.py --stats-only
+```
+
+The `playpen` CLI properly loads the huggingface model and runs the trainer code in the specified file.
+When training finishes, adapter checkpoints are stored under:
+`models/sft+lora/<model-name>-adapters/<run-suffix>`.
+The trainer also writes a timestamped model registry snapshot under `model_registries/`.
 
 > **Note:** Have a look at `examples/trl/sft_trainer_lora.py` for implementation details.
 
-To evaluate the LoRA fine-tuned model we register it in the local `modal_registry.json`, 
+To evaluate the LoRA fine-tuned model we register it in the local `model_registry.json`, 
 especially pointing to a `peft_model` in the `model_config`, as follows:
 ```json
 {
@@ -265,7 +370,7 @@ Run the SFT+LoRA TRL trainer example with a Llama3-8b learner (`-l`).
 This doesn't require a teacher, because the model is optimized based on the examples given in the dataset (imitation learning).
 
 ```bash
-playpen examples/trl/sft_trainer_lora.py -l llama3-8b
+playpen run examples/trl/sft_trainer_lora.py -l llama3-8b
 ```
 
 This saves the model checkpoint under a newly created folder at `models/sft+lora/llama3-8b`.
@@ -276,7 +381,7 @@ Run the GRPO+LoRA TRL trainer example with a Llama3-8b learner (`-l`)
 using max token length (`-L`) 300 and temperature (`-T`) 0.75.
 
 ```bash
-playpen examples/trl/grpo_trainer_lora_sp.py -l llama3-8b -L 300 -T 0.75
+playpen run examples/trl/grpo_trainer_lora_sp.py -l llama3-8b -L 300 -T 0.75
 ```
 
 This creates a `playpen-records` directory containing the generated interactions 
@@ -288,7 +393,7 @@ Run the GRPO+LoRA TRL trainer example with a Llama3-8b learner (`-l`)
 and a GPT-4 teacher (`-t`) model (for 2-player games) using max token length (`-L`) 300 and temperature (`-T`) 0.75. 
 
 ```bash
-playpen examples/trl/grpo_trainer_lora_mp.py -l llama3-8b -t gpt4o-mini -L 300 -T 0.75
+playpen run examples/trl/grpo_trainer_lora_mp.py -l llama3-8b -t gpt4o-mini -L 300 -T 0.75
 ```
 
 This creates a `playpen-records` directory containing the generated interactions 
