@@ -12,7 +12,7 @@ import torch
 
 from clemcore.backends.huggingface_local_api import HuggingfaceLocalModel
 from clemcore.clemgame import GameRegistry
-from datasets import load_dataset, concatenate_datasets
+from datasets import load_dataset, load_from_disk, concatenate_datasets
 from peft import LoraConfig
 import trl
 
@@ -273,14 +273,40 @@ def export_adapter_registry_snapshot(base_model_spec: dict, trained_runs: list) 
 
 
 def build_and_summarize_datasets():
+    def _load_train_interactions():
+        local_path = (os.getenv("PLAYPEN_TRAIN_INTERACTIONS_PATH") or "").strip()
+        if local_path:
+            p = Path(local_path).expanduser()
+            if not p.exists():
+                raise FileNotFoundError(
+                    f"PLAYPEN_TRAIN_INTERACTIONS_PATH does not exist: {p}"
+                )
+            print(f"[dataset] loading interactions from local path: {p}")
+            return load_from_disk(str(p))
+        print("[dataset] loading interactions from hub: colab-potsdam/playpen-data/interactions train")
+        return load_dataset("colab-potsdam/playpen-data", "interactions", split="train")
+
+    def _load_sft_final():
+        local_path = (os.getenv("PLAYPEN_SFT_FINAL_DATASET_PATH") or "").strip()
+        if local_path:
+            p = Path(local_path).expanduser()
+            if not p.exists():
+                raise FileNotFoundError(
+                    f"PLAYPEN_SFT_FINAL_DATASET_PATH does not exist: {p}"
+                )
+            print(f"[dataset] loading sft-final from local path: {p}")
+            return load_from_disk(str(p))
+        print("[dataset] loading sft-final from hub: clembench-playpen/SFT-Final-Dataset train")
+        return load_dataset("clembench-playpen/SFT-Final-Dataset", split="train")
+
     # === Load base playpen dataset ===
-    playpen_dataset = load_dataset("colab-potsdam/playpen-data", "interactions", split="train")
+    playpen_dataset = _load_train_interactions()
     playpen_dataset = playpen_dataset.filter(
         lambda episode: (episode["meta"] or {}).get("outcome", "").lower() == "success"
     )
 
     # === SFT-Final-Dataset ===
-    sft_final_dataset = load_dataset("clembench-playpen/SFT-Final-Dataset", split="train")
+    sft_final_dataset = _load_sft_final()
 
     def parse_and_clean_sft_messages(example):
         chat_data = []

@@ -92,6 +92,10 @@ class LossRouterConfig:
     log_path: Optional[str] = None
     oracle_field: str = "oracle_expert"
     id_regimes: Tuple[str, ...] = ("id",)
+    inference_mode: str = "legacy"
+    expert_to_cluster: Mapping[str, str] = None
+    game_to_cluster: Mapping[str, str] = None
+    routing_scope: str = "game"
 
 
 class NaiveBayesTextRouter:
@@ -360,6 +364,10 @@ def load_moe_config(moe: str, *, default_name: str, default_model: str) -> MoeCo
             log_path=str(loss_router_cfg["log_path"]) if loss_router_cfg.get("log_path") else None,
             oracle_field=str(loss_router_cfg.get("oracle_field", "oracle_expert") or "oracle_expert"),
             id_regimes=id_regimes or ("id",),
+            inference_mode=str(loss_router_cfg.get("inference_mode", "legacy") or "legacy"),
+            expert_to_cluster=dict(loss_router_cfg.get("expert_to_cluster") or {}),
+            game_to_cluster=dict(loss_router_cfg.get("game_to_cluster") or {}),
+            routing_scope=str(loss_router_cfg.get("routing_scope", "game") or "game"),
         )
 
     game_map = payload.get("game_map") or payload.get("game_name_map") or payload.get("game_to_model")

@@ -7,16 +7,17 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH --chdir=/home/bbmaltar/im/playpen
-#SBATCH -o /home/bbmaltar/im/playpen/logs/%x-%j.out
-#SBATCH -e /home/bbmaltar/im/playpen/logs/%x-%j.err
+#SBATCH --chdir=/netscratch/alueser/im/playpen
+#SBATCH -o /netscratch/alueser/im/playpen/logs/%x-%j.out
+#SBATCH -e /netscratch/alueser/im/playpen/logs/%x-%j.err
 
 set -euo pipefail
 
-REPO_DIR="/home/bbmaltar/im/playpen"
-BASE_REGISTRY="$REPO_DIR/model_registry.json"
-SCRATCH_ROOT="/scratch/usr/bbmaltar"
-HF_CACHE_ROOT="$SCRATCH_ROOT/hf-cache"
+REPO_DIR="${REPO_DIR:-/netscratch/alueser/im/playpen}"
+BASE_REGISTRY="${BASE_REGISTRY:-$REPO_DIR/model_registry.json}"
+SCRATCH_ROOT="${SCRATCH_ROOT:-/netscratch/alueser/im}"
+HF_CACHE_ROOT="${HF_CACHE_ROOT:-$SCRATCH_ROOT/hf-cache}"
+VENV_PATH="${VENV_PATH:-$REPO_DIR/.venv}"
 LEARNER_MODEL="${LEARNER_MODEL:-llama3-8b}"
 EXPERIMENT_TAG="${EXPERIMENT_TAG:-moe-residual-v1}"
 ADAPTER_BASE_ROOT="${ADAPTER_BASE_ROOT:-$SCRATCH_ROOT/playpen-adapters}"
@@ -34,8 +35,10 @@ EVAL_SUITE="${EVAL_SUITE:-all}"
 EVAL_GAME="${EVAL_GAME:-}"
 EVAL_MAX_TOKENS="${EVAL_MAX_TOKENS:-}"
 EVAL_SKIP_GAMEPLAY="${EVAL_SKIP_GAMEPLAY:-0}"
-PLAYPEN_EVAL_INSTANCES_PATH="${PLAYPEN_EVAL_INSTANCES_PATH:-/scratch/usr/bbmaltar/datasets/playpen-data-v3/instances-validation}"
-PLAYPEN_EVAL_INSTANCES_STATIC_PATH="${PLAYPEN_EVAL_INSTANCES_STATIC_PATH:-/scratch/usr/bbmaltar/datasets/playpen-data-v3/instances-static-validation}"
+PLAYPEN_EVAL_INSTANCES_PATH="${PLAYPEN_EVAL_INSTANCES_PATH:-$SCRATCH_ROOT/datasets/playpen-data-current/instances-validation}"
+PLAYPEN_EVAL_INSTANCES_STATIC_PATH="${PLAYPEN_EVAL_INSTANCES_STATIC_PATH:-$SCRATCH_ROOT/datasets/playpen-data-current/instances-static-validation}"
+PLAYPEN_TRAIN_INTERACTIONS_PATH="${PLAYPEN_TRAIN_INTERACTIONS_PATH:-$SCRATCH_ROOT/datasets/playpen-data-old-3158abb/interactions-train}"
+PLAYPEN_SFT_FINAL_DATASET_PATH="${PLAYPEN_SFT_FINAL_DATASET_PATH:-$SCRATCH_ROOT/datasets/sft-final-dataset/train}"
 MOE_EVAL_ROUTING_LOGS="${MOE_EVAL_ROUTING_LOGS:-1}"
 MOE_EVAL_ROUTING_FLUSH="${MOE_EVAL_ROUTING_FLUSH:-8}"
 PLAYPEN_MERGE_PREFER_MANUAL="${PLAYPEN_MERGE_PREFER_MANUAL:-weight_averaging,task_arithmetic}"
@@ -52,18 +55,21 @@ WANDB_DIR="${WANDB_DIR:-$SCRATCH_ROOT/wandb}"
 mkdir -p "$REPO_DIR/logs" "$HF_CACHE_ROOT" "$ADAPTER_BASE_ROOT" "$ADAPTER_ROOT" "$REGISTRY_OUT_DIR" "$EVAL_ROOT" "$WANDB_DIR"
 cd "$REPO_DIR"
 
-if ! type module >/dev/null 2>&1; then
-  source /etc/profile || true
+if [ -f "$VENV_PATH/bin/activate" ]; then
+  # shellcheck disable=SC1090
+  source "$VENV_PATH/bin/activate"
+else
+  if ! type module >/dev/null 2>&1; then
+    source /etc/profile || true
+  fi
+  module purge || true
+  module load slurm
+  module load NHRZIBenv
+  module load sw.a100.el9 || module load sw.clx.el9 || true
+  module load anaconda3/2023.09
+  source "$(conda info --base)/etc/profile.d/conda.sh"
+  conda activate playpen
 fi
-
-module purge || true
-module load slurm
-module load NHRZIBenv
-module load sw.a100.el9 || module load sw.clx.el9 || true
-module load anaconda3/2023.09
-
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate playpen
 
 auto_fix_cuda_visible_devices() {
   if python - <<'PY' >/dev/null 2>&1
@@ -111,7 +117,7 @@ export NLTK_DATA="${NLTK_DATA:-$HF_CACHE_ROOT/nltk_data}"
 
 : "${HF_HUB_OFFLINE:=1}"
 : "${HF_DATASETS_OFFLINE:=1}"
-HF_LOCAL_SNAPSHOT_FALLBACK="${HF_LOCAL_SNAPSHOT_FALLBACK:-/scratch/usr/bbmaltar/hf-cache/models--meta-llama--Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659}"
+HF_LOCAL_SNAPSHOT_FALLBACK="${HF_LOCAL_SNAPSHOT_FALLBACK:-}"
 export HF_HUB_OFFLINE HF_DATASETS_OFFLINE
 export HF_LOCAL_SNAPSHOT_FALLBACK
 
@@ -152,6 +158,8 @@ ln -sfn "$ADAPTER_BASE_ROOT" "$REPO_DIR/models/sft+lora"
 
 export PLAYPEN_TRAIN_TARGETS="$TRAIN_TARGETS"
 export PLAYPEN_PER_GAME_MAX_SAMPLES="$PER_GAME_MAX_SAMPLES"
+export PLAYPEN_TRAIN_INTERACTIONS_PATH
+export PLAYPEN_SFT_FINAL_DATASET_PATH
 export PLAYPEN_MODEL_REGISTRY_DIR="$REGISTRY_OUT_DIR"
 export PLAYPEN_SOURCE_MODEL_REGISTRY="$RUNTIME_REGISTRY"
 export PLAYPEN_SFT_MOE_RESIDUAL_CONFIG="$MOE_CONFIG_PATH"

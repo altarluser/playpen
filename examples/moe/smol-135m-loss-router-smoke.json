@@ -1,0 +1,16 @@
+{
+  "name": "smol-135m-lossrouter-smoke",
+  "default_model": "smol-135m",
+  "route_by_experiment": false,
+  "routes": [],
+  "loss_router": {
+    "experts": [
+      "smol-135m-sft"
+    ],
+    "inference_mode": "grouped_expert",
+    "routing_scope": "task",
+    "id_regimes": [
+      "id"
+    ]
+  }
+}

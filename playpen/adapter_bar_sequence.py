@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import gc
 import time
 from collections import Counter, OrderedDict, defaultdict
 from dataclasses import dataclass
@@ -115,6 +116,21 @@ def _adapter_bar_cfg(cfg: Mapping[str, Any]) -> Dict[str, Any]:
     return dict(cfg)
 
 
+def _load_tokenizer_from_core_hf(base_spec):
+    """
+    clemcore versions return either (tokenizer, config) or
+    (tokenizer, config, model_kwargs). Support both.
+    """
+    loaded = core_hf.load_config_and_tokenizer(base_spec)
+    if isinstance(loaded, tuple):
+        if len(loaded) >= 1:
+            return loaded[0]
+    raise ValueError(
+        "Unexpected return value from clemcore.load_config_and_tokenizer; "
+        f"got type={type(loaded).__name__}"
+    )
+
+
 def load_adapter_bar_mode_config(config_path: str, router_type: str) -> Dict[str, Any]:
     root = _adapter_bar_cfg(_load_cfg(config_path))
     mode_cfg = dict(root.get(str(router_type), {}) or {})
@@ -139,12 +155,30 @@ def _load_eval_dataset(dataset_name: str):
 def _load_router_training_mixture(seed: int):
     # Keep router training data source aligned with the existing SFT trainer:
     # playpen-data interactions + SFT-Final-Dataset.
-    playpen_dataset = load_dataset("colab-potsdam/playpen-data", "interactions", split="train")
+    train_interactions_path = (__import__("os").getenv("PLAYPEN_TRAIN_INTERACTIONS_PATH") or "").strip()
+    if train_interactions_path:
+        local_path = Path(train_interactions_path).expanduser()
+        if not local_path.exists():
+            raise FileNotFoundError(
+                f"PLAYPEN_TRAIN_INTERACTIONS_PATH does not exist: {local_path}"
+            )
+        playpen_dataset = load_from_disk(str(local_path))
+    else:
+        playpen_dataset = load_dataset("colab-potsdam/playpen-data", "interactions", split="train")
     playpen_dataset = playpen_dataset.filter(
         lambda episode: ((episode.get("meta") or {}).get("outcome", "") or "").lower() == "success"
     )
 
-    sft_final_dataset = load_dataset("clembench-playpen/SFT-Final-Dataset", split="train")
+    sft_final_path = (__import__("os").getenv("PLAYPEN_SFT_FINAL_DATASET_PATH") or "").strip()
+    if sft_final_path:
+        local_path = Path(sft_final_path).expanduser()
+        if not local_path.exists():
+            raise FileNotFoundError(
+                f"PLAYPEN_SFT_FINAL_DATASET_PATH does not exist: {local_path}"
+            )
+        sft_final_dataset = load_from_disk(str(local_path))
+    else:
+        sft_final_dataset = load_dataset("clembench-playpen/SFT-Final-Dataset", split="train")
 
     def parse_and_clean_sft_messages(example):
         chat_data = []
@@ -217,6 +251,13 @@ def _input_text_from_example(example: Mapping[str, Any]) -> str:
         if isinstance(v, str) and v.strip():
             return v.strip()
     return ""
+
+
+def _router_param_dtype(router: torch.nn.Module) -> torch.dtype:
+    try:
+        return next(router.parameters()).dtype
+    except StopIteration:
+        return torch.float32
 
 
 def _label_for(game: Optional[str], router_type: str, cfg: Mapping[str, Any]) -> Optional[str]:
@@ -403,7 +444,7 @@ def train_router(config_path: str, router_type: str, debug: bool = False) -> Dic
     if not base_model_name:
         raise ValueError("adapter_bar_sequence config requires base_model_name for router training")
     base_spec = _strip_adapters(_base_model_spec(model_registry, base_model_name))
-    tokenizer, _, _ = core_hf.load_config_and_tokenizer(base_spec)
+    tokenizer = _load_tokenizer_from_core_hf(base_spec)
     base_model = core_hf.load_model(base_spec)
     for p in base_model.parameters():
         p.requires_grad = False
@@ -447,6 +488,7 @@ def train_router(config_path: str, router_type: str, debug: bool = False) -> Dic
                 ys.append(lid)
             x = torch.cat(feats, dim=0)
             y = torch.tensor(ys, dtype=torch.long, device=device)
+            x = x.to(dtype=_router_param_dtype(router))
             logits = router(x)
             loss = F.cross_entropy(logits, y)
             opt.zero_grad(set_to_none=True)
@@ -480,6 +522,7 @@ def train_router(config_path: str, router_type: str, debug: bool = False) -> Dic
                     lbls.append(str(r.get("label_name")))
                 x = torch.cat(feats, dim=0)
                 y = torch.tensor(ys, dtype=torch.long, device=device)
+                x = x.to(dtype=_router_param_dtype(router))
                 logits = router(x)
                 loss = F.cross_entropy(logits, y)
                 va_loss += float(loss.item()) * len(batch)
@@ -557,8 +600,34 @@ def load_router_bundle(config_path: str, router_path: str, router_type: str) -> 
     if not base_model_name:
         raise ValueError("adapter_bar eval requires base_model_name in config")
     base_spec = _strip_adapters(_base_model_spec(model_registry, base_model_name))
-    tokenizer, _, _ = core_hf.load_config_and_tokenizer(base_spec)
-    base_model = core_hf.load_model(base_spec)
+    tokenizer = _load_tokenizer_from_core_hf(base_spec)
+    retries = max(0, int(__import__("os").getenv("PLAYPEN_CUDA_LOAD_RETRIES", "2")))
+    attempt = 0
+    base_model = None
+    while True:
+        base_model = core_hf.load_model(base_spec)
+        hf_device_map = getattr(base_model, "hf_device_map", None)
+        has_cpu_or_disk = isinstance(hf_device_map, dict) and any(
+            isinstance(dev, str) and dev in {"cpu", "disk"} for dev in hf_device_map.values()
+        )
+        try:
+            first_param = next(base_model.parameters())
+            on_cuda = str(first_param.device).startswith("cuda")
+        except StopIteration:
+            on_cuda = False
+        if on_cuda and not has_cpu_or_disk:
+            break
+        if attempt >= retries:
+            raise RuntimeError(
+                "Adapter-BAR base model could not be placed fully on CUDA after retries. "
+                f"attempts={attempt + 1}, hf_device_map={hf_device_map}"
+            )
+        attempt += 1
+        del base_model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        time.sleep(2)
     for p in base_model.parameters():
         p.requires_grad = False
     base_model.eval()
@@ -580,6 +649,7 @@ def load_router_bundle(config_path: str, router_path: str, router_type: str) -> 
 def predict_adapter(bundle: RouterBundle, input_text: str) -> Dict[str, Any]:
     device = next(bundle.base_model.parameters()).device
     pooled = _encode_pool(bundle.tokenizer, bundle.base_model, input_text, bundle.cfg.get("router_pooling", "last_token"), device)
+    pooled = pooled.to(dtype=_router_param_dtype(bundle.router))
     logits = bundle.router(pooled)
     probs = torch.softmax(logits, dim=-1)[0]
     pred_id = int(torch.argmax(probs).item())

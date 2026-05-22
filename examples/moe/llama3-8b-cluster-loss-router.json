@@ -1,0 +1,38 @@
+{
+  "name": "llama3-8b-cluster-lossrouter",
+  "default_model": "llama3-8b",
+  "route_by_experiment": false,
+  "routes": [],
+  "loss_router": {
+    "experts": [
+      "llama3-8b-cluster-wordguessing",
+      "llama3-8b-cluster-explorationnavigation",
+      "llama3-8b-cluster-cooperation"
+    ],
+    "inference_mode": "grouped_expert",
+    "id_regimes": [
+      "id"
+    ],
+    "expert_to_cluster": {
+      "llama3-8b-cluster-wordguessing": "wordguessing",
+      "llama3-8b-cluster-explorationnavigation": "explorationnavigation",
+      "llama3-8b-cluster-cooperation": "cooperation"
+    },
+    "game_to_cluster": {
+      "codenames": "wordguessing",
+      "taboo": "wordguessing",
+      "guesswhat": "wordguessing",
+      "wordle": "wordguessing",
+      "wordle_withclue": "wordguessing",
+      "wordle_withcritic": "wordguessing",
+      "adventuregame": "explorationnavigation",
+      "textmapworld": "explorationnavigation",
+      "textmapworld_graphreasoning": "explorationnavigation",
+      "textmapworld_specificroom": "explorationnavigation",
+      "imagegame": "cooperation",
+      "matchit_ascii": "cooperation",
+      "referencegame": "cooperation",
+      "privateshared": "cooperation"
+    }
+  }
+}

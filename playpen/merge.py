@@ -399,14 +399,35 @@ def apply_merge_if_requested(model, model_spec, logger=None):
     merge_weights = model_config.get("merge_weights")
     if merge_weights is None:
         # Standard defaults:
-        # - task_arithmetic: equal coefficients (1.0 each)
         # - weight_averaging: equal weights then normalized to 1/N
         # - ties: equal weights
-        merge_weights = [1.0] * len(adapter_models)
+        # - task_arithmetic: by default, auto-match WA magnitude with 1/N coefficients.
+        if merge_method == "task_arithmetic":
+            ta_match_wa = bool(
+                model_config.get(
+                    "task_arithmetic_match_wa_magnitude",
+                    model_config.get("merge_task_arithmetic_match_wa_magnitude", True),
+                )
+            )
+            if ta_match_wa:
+                n = len(adapter_models)
+                merge_weights = [1.0 / float(n)] * n
+            else:
+                merge_weights = [1.0] * len(adapter_models)
+        else:
+            merge_weights = [1.0] * len(adapter_models)
     if logger is not None:
         try:
             logger.info("Merging adapters via %s: %s", merge_method, adapter_models)
-            logger.info("Merge weights (raw): %s", merge_weights)
+            logger.info("Merge weights: %s", merge_weights)
+            if merge_method == "task_arithmetic":
+                ta_match_wa = bool(
+                    model_config.get(
+                        "task_arithmetic_match_wa_magnitude",
+                        model_config.get("merge_task_arithmetic_match_wa_magnitude", True),
+                    )
+                )
+                logger.info("task_arithmetic_match_wa_magnitude=%s", ta_match_wa)
             if merge_method == "ties":
                 ties_k = float(model_config.get("ties_k", model_config.get("merge_ties_k", 0.20)))
                 majority_sign_method = str(

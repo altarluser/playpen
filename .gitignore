@@ -20,10 +20,10 @@ model_registry.json
 model_registries/
 trainer*.py
 .venv/
-.venv/
 *.sbatch
 *.sh
 local_datasets
-analysis-outputs/
+**/analysis_outputs/
 outputs/
-*.sbatch
+docs/
+*.zip

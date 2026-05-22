@@ -45,6 +45,25 @@ class EvalRoutingLogger:
             self.cumulative[layer_idx] = self._empty_stats()
 
     @staticmethod
+    def _resize_stats(stats: Dict[str, object], size: int) -> None:
+        for key in ("top1", "topk", "gate_mass"):
+            values = list(stats.get(key, []))
+            if len(values) < size:
+                values.extend([0.0] * (size - len(values)))
+            elif len(values) > size:
+                del values[size:]
+            stats[key] = values
+
+    def _ensure_num_experts(self, actual_num_experts: int) -> None:
+        actual_num_experts = max(1, int(actual_num_experts))
+        if actual_num_experts == self.num_experts:
+            return
+        self.num_experts = actual_num_experts
+        for collection in (self.buffer, self.cumulative, self.context_cumulative):
+            for stats in collection.values():
+                self._resize_stats(stats, actual_num_experts)
+
+    @staticmethod
     def _context_from_env() -> Tuple[str, str, str]:
         game = str(os.getenv("PLAYPEN_EVAL_GAME", "unknown")).strip() or "unknown"
         split = str(os.getenv("PLAYPEN_EVAL_SPLIT", "unknown")).strip() or "unknown"
@@ -65,13 +84,17 @@ class EvalRoutingLogger:
 
     @torch.no_grad()
     def record(self, layer_idx: int, gate_probs: torch.Tensor, topk_idx: torch.Tensor) -> None:
+        actual_num_experts = int(gate_probs.shape[-1]) if gate_probs.ndim > 0 else 0
+        if actual_num_experts <= 0:
+            return
+        self._ensure_num_experts(actual_num_experts)
         self._ensure_layer(int(layer_idx))
         game, split, regime = self._context_from_env()
         top1_idx = topk_idx[:, 0]
         topk_flat = topk_idx.reshape(-1)
         top1_counts = torch.bincount(top1_idx, minlength=self.num_experts).to(dtype=torch.float64)
         topk_counts = torch.bincount(topk_flat, minlength=self.num_experts).to(dtype=torch.float64)
-        gate_mass = gate_probs.sum(dim=0).to(dtype=torch.float64)
+        gate_mass = gate_probs.reshape(-1, self.num_experts).sum(dim=0).to(dtype=torch.float64)
         entropy = (-gate_probs * torch.log(gate_probs.clamp_min(1e-9))).sum().item()
         tokens = float(topk_idx.shape[0])
 
@@ -150,21 +173,26 @@ class EvalRoutingLogger:
         self._export_context_usage_csv()
 
     def _export_context_usage_csv(self) -> None:
-        with self.latent_usage_csv_path.open("w", newline="", encoding="utf-8") as f:
+        # Use append mode so that when the model is reloaded per-game (creating one logger
+        # per game, each writing via atexit), all games accumulate in the same file rather
+        # than the last writer (LIFO atexit order) overwriting everything else.
+        write_header = not self.latent_usage_csv_path.exists() or self.latent_usage_csv_path.stat().st_size == 0
+        with self.latent_usage_csv_path.open("a", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(
-                [
-                    "game",
-                    "split",
-                    "regime",
-                    "layer",
-                    "expert_id",
-                    "top1_count",
-                    "top1_proportion",
-                    "tokens",
-                    "avg_entropy",
-                ]
-            )
+            if write_header:
+                writer.writerow(
+                    [
+                        "game",
+                        "split",
+                        "regime",
+                        "layer",
+                        "expert_id",
+                        "top1_count",
+                        "top1_proportion",
+                        "tokens",
+                        "avg_entropy",
+                    ]
+                )
             for (game, split, regime, layer_idx), stats in sorted(self.context_cumulative.items()):
                 top1 = list(stats["top1"])
                 total_top1 = max(1.0, sum(top1))
@@ -251,7 +279,11 @@ class SparseMoEFFN(torch.nn.Module):
             output.index_add_(0, token_idx, routed)
 
         if self.routing_logger is not None:
-            self.routing_logger.record(self.layer_idx, gate_probs.detach(), topk_idx.detach())
+            try:
+                self.routing_logger.record(self.layer_idx, gate_probs.detach(), topk_idx.detach())
+            except Exception:
+                # Routing diagnostics must never change gameplay/evaluation behavior.
+                pass
         return output.view(original_shape)
 
 
@@ -376,7 +408,11 @@ class ResidualSparseSkillMoEFFN(torch.nn.Module):
             output.index_add_(0, kept, routed)
 
         if self.routing_logger is not None:
-            self.routing_logger.record(self.layer_idx, gate_probs.detach(), top1_idx.unsqueeze(-1).detach())
+            try:
+                self.routing_logger.record(self.layer_idx, gate_probs.detach(), top1_idx.unsqueeze(-1).detach())
+            except Exception:
+                # Routing diagnostics must never change gameplay/evaluation behavior.
+                pass
         return dense_out + (self.alpha * output.view(original_shape))
 
 
@@ -431,6 +467,17 @@ def _resolve_moe_state_path(model_spec) -> Optional[Path]:
     for candidate in candidates:
         if candidate.exists() and candidate.is_file():
             return candidate
+    return None
+
+
+def _resolve_moe_adapter_path(model_spec) -> Optional[Path]:
+    model_config = getattr(model_spec, "model_config", {}) or {}
+    adapter_path = model_config.get("moe_lora_adapter_path")
+    if not adapter_path:
+        return None
+    candidate = Path(str(adapter_path)).expanduser()
+    if candidate.exists():
+        return candidate
     return None
 
 
@@ -547,9 +594,26 @@ def _replace_last_mlp_with_residual_moe(model, model_config, routing_logger: Opt
     return layer_indices
 
 
+def _is_moe_runtime_already_applied(model) -> bool:
+    return bool(getattr(model, "_playpen_moe_runtime_applied", False))
+
+
+def _mark_moe_runtime_applied(model) -> None:
+    try:
+        setattr(model, "_playpen_moe_runtime_applied", True)
+    except Exception:
+        pass
+
+
+def _should_log_moe_state_debug_keys() -> bool:
+    return str(os.getenv("PLAYPEN_MOE_STATE_DEBUG_KEYS", "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def apply_moe_if_requested(model, model_spec, logger=None):
     model_config = getattr(model_spec, "model_config", {}) or {}
     if not bool(model_config.get("moe_enabled", False)):
+        return model
+    if _is_moe_runtime_already_applied(model):
         return model
 
     moe_mode = str(model_config.get("moe_mode", "replace")).strip().lower()
@@ -578,6 +642,7 @@ def apply_moe_if_requested(model, model_spec, logger=None):
                 )
             except Exception:
                 pass
+        _mark_moe_runtime_applied(model)
         return model
 
     try:
@@ -593,8 +658,10 @@ def apply_moe_if_requested(model, model_spec, logger=None):
 
         moe_state = _normalize_moe_state_dict(raw_state)
         incompatible = model.load_state_dict(moe_state, strict=False)
-        missing = len(getattr(incompatible, "missing_keys", []))
-        unexpected = len(getattr(incompatible, "unexpected_keys", []))
+        missing_keys = list(getattr(incompatible, "missing_keys", []))
+        unexpected_keys = list(getattr(incompatible, "unexpected_keys", []))
+        missing = len(missing_keys)
+        unexpected = len(unexpected_keys)
         if logger is not None:
             try:
                 logger.info(
@@ -605,9 +672,40 @@ def apply_moe_if_requested(model, model_spec, logger=None):
                     missing,
                     unexpected,
                 )
+                if _should_log_moe_state_debug_keys():
+                    logger.info(
+                        "MoE state debug for %s: first_missing=%s",
+                        getattr(model_spec, "model_name", "model"),
+                        missing_keys[:20],
+                    )
+                    logger.info(
+                        "MoE state debug for %s: first_unexpected=%s",
+                        getattr(model_spec, "model_name", "model"),
+                        unexpected_keys[:20],
+                    )
             except Exception:
                 pass
     except Exception as e:
         raise RuntimeError(f"Failed to apply MoE runtime from {state_path}: {e}") from e
 
+    adapter_path = _resolve_moe_adapter_path(model_spec)
+    if adapter_path is not None:
+        try:
+            from peft import PeftModel
+
+            model = PeftModel.from_pretrained(model, str(adapter_path), is_trainable=False)
+            model.eval()
+            if logger is not None:
+                try:
+                    logger.info(
+                        "Applied MoE LoRA adapter for %s from %s.",
+                        getattr(model_spec, "model_name", "model"),
+                        str(adapter_path),
+                    )
+                except Exception:
+                    pass
+        except Exception as e:
+            raise RuntimeError(f"Failed to apply MoE LoRA adapter from {adapter_path}: {e}") from e
+
+    _mark_moe_runtime_applied(model)
     return model

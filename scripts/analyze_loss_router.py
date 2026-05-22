@@ -112,6 +112,28 @@ def main():
             regrets.append(float(sel_nll) - float(best_nll))
     routing_regret = _mean(regrets) if regrets else None
 
+    semantic_rows = [r for r in id_rows if r.get("semantic_oracle_cluster") is not None]
+    semantic_acc = None
+    if semantic_rows:
+        vals = []
+        for r in semantic_rows:
+            v = r.get("semantic_cluster_match")
+            if v is None:
+                continue
+            vals.append(1.0 if bool(v) else 0.0)
+        semantic_acc = _mean(vals) if vals else None
+
+    semantic_regrets = []
+    for r in semantic_rows:
+        v = r.get("semantic_regret_vs_cluster_oracle")
+        if v is None:
+            continue
+        try:
+            semantic_regrets.append(float(v))
+        except Exception:
+            pass
+    semantic_regret = _mean(semantic_regrets) if semantic_regrets else None
+
     avg_margin_by_game = {g: _mean(v) for g, v in margins_by_game.items() if v}
     entropy_by_game = {g: _entropy(v) for g, v in selected_by_game.items() if v}
 
@@ -123,6 +145,9 @@ def main():
         "usage_proportions_by_game": usage_props_by_game,
         "routing_accuracy_vs_oracle_id_only": acc,
         "routing_regret_vs_oracle_id_only": routing_regret,
+        "semantic_cluster_rows_id": len(semantic_rows),
+        "semantic_cluster_accuracy_id_only": semantic_acc,
+        "semantic_cluster_regret_id_only": semantic_regret,
         "average_routing_margin_by_game": avg_margin_by_game,
         "expert_selection_entropy_by_game": entropy_by_game,
     }
