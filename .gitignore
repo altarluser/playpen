@@ -24,3 +24,6 @@ trainer*.py
 *.sbatch
 *.sh
 local_datasets
+analysis-outputs/
+outputs/
+*.sbatch
